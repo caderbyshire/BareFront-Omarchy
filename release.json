@@ -1,0 +1,16 @@
+{
+  "name": "BareFront for Omarchy",
+  "version": "0.1.0-preview.1",
+  "status": "preview",
+  "upstream": "https://github.com/craigaderbyshire/BareFront",
+  "upstreamCommit": "8f0f2da8d7ff4e5fddb48705bbf76bc6e271e8ac",
+  "target": {
+    "distribution": "Omarchy 4",
+    "architecture": "x86_64",
+    "presentation": "1920x1080"
+  },
+  "romsIncluded": false,
+  "biosIncluded": false,
+  "userDataIncluded": false,
+  "upstreamInstallerSha256": "6fbe5e39af707b9e0ef4ac4b5b7ee442d77e753fa0668245f9995f408269c594"
+}

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+application/scripts/install_barefront_arch.sh
+application/scripts/install_barefront_arch.tmp
+application/barefront
+application/barefront.ini
+application/logs/
+application/roms/
+application/bios/
+application/saves/
+application/content/
+application/runtime/
+application/assets/games/
+application/assets/videos/
+application/.omarchy-*

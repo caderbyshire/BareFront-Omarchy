@@ -1,0 +1,11170 @@
+#!/bin/bash
+
+# ============================================================
+# BareFront Installer
+# v0.12
+#
+# Stage 1: Pre-flight checks
+# Stage 2: Common Debian dependencies
+# Stage 3A: Debian/package-managed emulators
+# Stage 2B: Production BareFront directory structure
+# Stage 3B: Locally managed emulators
+# Stage 4: Production launcher adapters + barefront.ini
+# ============================================================
+
+set -Eeuo pipefail
+
+BAREFRONT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="$BAREFRONT_DIR/logs"
+LOG_FILE="$LOG_DIR/install.log"
+
+mkdir -p "$LOG_DIR"
+
+# Write terminal output and errors to both the screen and log.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+heading()
+{
+    echo
+    echo "================================================"
+    echo "$1"
+    echo "================================================"
+    echo
+}
+
+die()
+{
+    echo
+    echo "ERROR: $1"
+    echo
+    echo "See:"
+    echo "  $LOG_FILE"
+    exit 1
+}
+
+package_is_installed()
+{
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null \
+        | grep -q '^install ok installed$'
+}
+
+install_debian_emulator()
+{
+    local display_name="$1"
+    local package_name="$2"
+    local executable="$3"
+
+    echo
+    echo "------------------------------------------------"
+    echo "$display_name"
+    echo "------------------------------------------------"
+
+    if package_is_installed "$package_name"; then
+        echo "Package '$package_name' is already installed."
+        echo "  Action: SKIP"
+    else
+        echo "Installing Debian package:"
+        echo "  $package_name"
+
+        if sudo apt-get install -y "$package_name"; then
+            echo "Package installation completed."
+        else
+            echo
+            echo "FAILED: Debian could not install '$package_name'."
+            return 1
+        fi
+    fi
+
+    if [[ -x "$executable" ]]; then
+        echo "Executable verified:"
+        echo "  $executable"
+        return 0
+    else
+        echo
+        echo "FAILED: Expected executable was not found:"
+        echo "  $executable"
+        return 1
+    fi
+}
+
+
+# ============================================================
+# Opening screen
+# ============================================================
+
+clear 2>/dev/null || true
+
+echo
+echo "================================================"
+echo "                B A R E F R O N T"
+echo "================================================"
+echo
+echo "BareFront Installer v0.12"
+echo
+echo "BareFront launches."
+echo "Emulators emulate."
+echo "Gamescope presents."
+echo
+
+
+# ============================================================
+# Stage 1 - Pre-flight
+# ============================================================
+
+heading "STAGE 1 / PRE-FLIGHT CHECKS"
+
+if [[ ! -f /etc/os-release ]]; then
+    die "Cannot identify this Linux distribution."
+fi
+
+source /etc/os-release
+
+echo "Operating system:"
+echo "  ${PRETTY_NAME:-Unknown}"
+
+if [[ "${ID:-}" != "debian" ]]; then
+    die "BareFront currently supports Debian only."
+fi
+
+if [[ "${VERSION_ID:-}" != "13" ]]; then
+    die "BareFront currently supports Debian 13 (Trixie)."
+fi
+
+echo "  Debian 13 check: OK"
+
+ARCH="$(dpkg --print-architecture)"
+
+echo
+echo "Architecture:"
+echo "  $ARCH"
+
+if [[ "$ARCH" != "amd64" ]]; then
+    die "BareFront currently supports amd64/x86-64 only."
+fi
+
+echo "  Architecture check: OK"
+
+if [[ "$EUID" -eq 0 ]]; then
+    die "Do not run the whole installer with sudo. Run it as your normal user."
+fi
+
+echo
+echo "User:"
+echo "  $USER"
+echo "  Normal-user check: OK"
+
+echo
+echo "Checking sudo access..."
+
+if ! sudo -v; then
+    die "sudo authentication failed."
+fi
+
+echo "  sudo check: OK"
+
+# An explicit local archive supports offline installation.
+# Otherwise, Stage 2A downloads the pinned public release after
+# curl and CA certificates have been installed by Stage 2.
+PRESENTATION_RELEASE_ARCHIVE="${BAREFRONT_PRESENTATION_ARCHIVE:-}"
+
+if [[ -n "$PRESENTATION_RELEASE_ARCHIVE" &&
+      ! -f "$PRESENTATION_RELEASE_ARCHIVE" ]]; then
+    die "The supplied BAREFRONT_PRESENTATION_ARCHIVE does not exist."
+fi
+
+
+# ============================================================
+# Stage 2 - Common Debian dependencies
+# ============================================================
+
+heading "STAGE 2 / DEBIAN DEPENDENCIES"
+
+echo "Refreshing Debian package catalogue..."
+echo
+echo "This also acts as our first real network/repository check."
+echo
+
+# We deliberately use apt-get update as the network check.
+# A fresh Debian installation may not have curl or wget yet,
+# but apt-get is guaranteed to be present on our supported target.
+if ! sudo apt-get update; then
+    die "Debian could not refresh its package catalogue. Check the network connection and repository configuration."
+fi
+
+echo
+echo "  Network/repository check: OK"
+
+BASE_PACKAGES=(
+    build-essential
+    pkg-config
+    git
+    curl
+    wget
+    ca-certificates
+    unzip
+    zip
+    p7zip-full
+    xz-utils
+    file
+    rsync
+    jq
+    python3
+    udisks2
+    cifs-utils
+    keyutils
+    pulseaudio-utils
+)
+
+BAREFRONT_PACKAGES=(
+    libsdl2-dev
+    libsdl2-image-dev
+    libsdl2-ttf-dev
+    libsdl2-mixer-dev
+    ffmpeg
+)
+
+CAPTURE_PACKAGES=(
+    gstreamer1.0-tools
+    gstreamer1.0-pipewire
+    gstreamer1.0-plugins-base
+    gstreamer1.0-plugins-good
+    gstreamer1.0-plugins-ugly
+)
+
+GRAPHICS_PACKAGES=(
+    libgl1-mesa-dev
+    libopengl0
+    libvulkan1
+    mesa-vulkan-drivers
+    vulkan-tools
+    vkbasalt
+    x11-xserver-utils
+    libfuse2t64
+    libx11-dev
+    libxtst-dev
+    libxi-dev
+    libxfixes-dev
+    libxrender-dev
+)
+
+ALL_PACKAGES=(
+    "${BASE_PACKAGES[@]}"
+    "${BAREFRONT_PACKAGES[@]}"
+    "${CAPTURE_PACKAGES[@]}"
+    "${GRAPHICS_PACKAGES[@]}"
+)
+
+echo
+echo "Installing/verifying common dependencies..."
+
+sudo apt-get install -y "${ALL_PACKAGES[@]}"
+
+echo
+echo "Common dependency stage complete."
+
+
+# ============================================================
+# Stage 2A - Gamescope presentation layer
+# ============================================================
+
+heading "STAGE 2A / GAMESCOPE PRESENTATION"
+
+GAMESCOPE_EXE="/usr/games/gamescope"
+GAMESCOPE_LAUNCHER="$BAREFRONT_DIR/scripts/launch_barefront_gamescope.sh"
+GAMESCOPE_BACKPORTS_SOURCE="/etc/apt/sources.list.d/barefront-backports.sources"
+
+echo "Installing/verifying PipeWire support for Gamescope..."
+
+if package_is_installed "pipewire" && \
+   package_is_installed "pipewire-bin"
+then
+    echo "PipeWire packages are already installed."
+    echo "  Action: SKIP"
+else
+    # BareFront deliberately retains the desktop's existing audio
+    # server. pipewire-pulse and a separate session manager are not
+    # needed for Gamescope's capture connection.
+    if ! sudo apt-get install -y \
+        --no-install-recommends \
+        pipewire \
+        pipewire-bin
+    then
+        die "Could not install Gamescope's PipeWire support."
+    fi
+fi
+
+echo
+echo "Starting/verifying the PipeWire user service..."
+
+if ! systemctl --user enable --now \
+    pipewire.socket \
+    pipewire.service
+then
+    die "Could not enable the PipeWire user service."
+fi
+
+if ! systemctl --user is-active --quiet pipewire.service; then
+    die "PipeWire user service is not active."
+fi
+
+if ! pw-cli info 0 >/dev/null 2>&1; then
+    die "PipeWire connection verification failed."
+fi
+
+echo "  PipeWire connection: OK"
+
+echo
+echo "Installing/verifying Gamescope..."
+
+if package_is_installed "gamescope"; then
+    echo "Gamescope is already installed."
+    echo "  Action: SKIP"
+else
+    echo "Gamescope is supplied by Debian 13 backports."
+    echo "Creating BareFront-owned repository file:"
+    echo "  $GAMESCOPE_BACKPORTS_SOURCE"
+
+    sudo tee "$GAMESCOPE_BACKPORTS_SOURCE" >/dev/null <<'EOF'
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie-backports
+Components: main contrib
+Enabled: yes
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+
+    echo
+    echo "Refreshing APT after enabling backports..."
+
+    if ! sudo apt-get update; then
+        die "APT update failed after enabling Debian backports."
+    fi
+
+    if ! sudo apt-get install -y \
+        -t trixie-backports \
+        gamescope
+    then
+        die "Could not install Gamescope from Debian backports."
+    fi
+fi
+
+if [[ ! -x "$GAMESCOPE_EXE" ]]; then
+    die "Gamescope executable not found: $GAMESCOPE_EXE"
+fi
+
+if [[ ! -f "$GAMESCOPE_LAUNCHER" ]]; then
+    die "Tracked Gamescope launcher missing: $GAMESCOPE_LAUNCHER"
+fi
+
+chmod +x "$GAMESCOPE_LAUNCHER"
+
+if [[ ! -x "$GAMESCOPE_LAUNCHER" ]]; then
+    die "BareFront Gamescope launcher is not executable."
+fi
+
+GAMESCOPE_PACKAGE_VERSION="$(
+    dpkg-query -W -f='${Version}' gamescope 2>/dev/null || true
+)"
+
+echo
+echo "Gamescope presentation dependencies verified."
+echo "  Executable: $GAMESCOPE_EXE"
+echo "  Package version: ${GAMESCOPE_PACKAGE_VERSION:-Unknown}"
+echo "  BareFront launcher: $GAMESCOPE_LAUNCHER"
+echo "  PipeWire service: active"
+echo
+
+# ============================================================
+# Stage 2A - BareFront-owned patched presentation runtime
+# ============================================================
+
+heading "STAGE 2A / PATCHED PRESENTATION RUNTIME"
+
+PRESENTATION_RELEASE_SHA256="9aabed1d4813c943edd94c17dd962d2af90ce6bde421687de1929cf00c69ee48"
+PRESENTATION_INSTALLER="$BAREFRONT_DIR/scripts/install_presentation_runtime.sh"
+
+PRESENTATION_DOWNLOAD_DIR=""
+
+# Clean up only files created by this Stage 2A download.
+# Do not install a global EXIT trap: later installer stages own their traps.
+presentation_cleanup_download()
+{
+    [[ -n "$PRESENTATION_DOWNLOAD_DIR" ]] || return 0
+
+    rm -f -- \
+        "$PRESENTATION_DOWNLOAD_DIR/barefront-presentation-debian13-amd64-v2.tar.xz.part" \
+        "$PRESENTATION_DOWNLOAD_DIR/barefront-presentation-debian13-amd64-v2.tar.xz"
+
+    rmdir -- "$PRESENTATION_DOWNLOAD_DIR"
+    PRESENTATION_DOWNLOAD_DIR=""
+}
+
+if [[ -z "$PRESENTATION_RELEASE_ARCHIVE" ]]; then
+    PRESENTATION_RELEASE_URL="https://github.com/craigaderbyshire/BareFront-Presentation-Runtime/releases/download/v2/barefront-presentation-debian13-amd64-v2.tar.xz"
+
+    command -v curl >/dev/null 2>&1 ||
+        die "curl is required to download the presentation runtime."
+
+    PRESENTATION_DOWNLOAD_DIR="$(
+        mktemp -d "${TMPDIR:-/tmp}/barefront-presentation-v2.XXXXXX"
+    )" || die "Could not create presentation download directory."
+
+    PRESENTATION_RELEASE_ARCHIVE="$PRESENTATION_DOWNLOAD_DIR/barefront-presentation-debian13-amd64-v2.tar.xz"
+    PRESENTATION_PARTIAL="$PRESENTATION_RELEASE_ARCHIVE.part"
+
+    echo "Downloading BareFront's pinned presentation runtime..."
+
+    if ! curl \
+        --fail \
+        --location \
+        --silent \
+        --show-error \
+        --retry 3 \
+        --connect-timeout 15 \
+        --proto '=https' \
+        --proto-redir '=https' \
+        --output "$PRESENTATION_PARTIAL" \
+        "$PRESENTATION_RELEASE_URL"
+    then
+        presentation_cleanup_download
+        die "Could not download the pinned presentation runtime."
+    fi
+
+    echo "Verifying downloaded presentation runtime..."
+
+    if ! printf '%s  %s\n' \
+        "$PRESENTATION_RELEASE_SHA256" \
+        "$PRESENTATION_PARTIAL" | sha256sum --check -
+    then
+        presentation_cleanup_download
+        die "Downloaded presentation runtime failed SHA-256 verification."
+    fi
+
+    if ! mv -- "$PRESENTATION_PARTIAL" "$PRESENTATION_RELEASE_ARCHIVE"; then
+        presentation_cleanup_download
+        die "Could not finalise the downloaded presentation runtime."
+    fi
+
+    echo "Pinned presentation runtime downloaded and verified."
+else
+    echo "Using explicitly supplied local presentation archive."
+fi
+
+if [[ ! -x "$PRESENTATION_INSTALLER" ]]; then
+    presentation_cleanup_download
+    die "BareFront presentation runtime installer is missing."
+fi
+
+if ! "$PRESENTATION_INSTALLER" \
+    "$PRESENTATION_RELEASE_ARCHIVE" \
+    "$PRESENTATION_RELEASE_SHA256" \
+    "$BAREFRONT_DIR"
+then
+    presentation_cleanup_download
+    die "BareFront's pinned presentation runtime failed to install."
+fi
+
+source "$BAREFRONT_DIR/scripts/barefront_presentation_runtime.sh"
+
+if ! barefront_resolve_presentation_runtime "$BAREFRONT_DIR"; then
+    presentation_cleanup_download
+    die "BareFront's private presentation runtime failed verification."
+fi
+
+echo
+echo "Private Gamescope: $BAREFRONT_GAMESCOPE"
+echo "Private Vulkan layers: $BAREFRONT_VKBASALT_LAYER_DIR"
+echo "Patched presentation runtime: OK"
+
+# The installer has finished consuming the archive and verified its runtime.
+presentation_cleanup_download
+echo
+
+# ============================================================
+# Stage 2B - Production BareFront directory structure
+# ============================================================
+
+heading "STAGE 2B / BAREFRONT DIRECTORIES"
+
+echo "Creating the standard production directory structure."
+echo
+echo "Official game-library path:"
+echo "  $BAREFRONT_DIR/roms"
+echo
+echo "'testroms' is development-only and is NOT used by the"
+echo "production installer."
+echo
+
+SYSTEM_KEYS=(
+    megadrive
+    nes
+    snes
+    ps1
+    ps2
+    mastersystem
+    atari2600
+    c64
+    arcade
+    neogeo
+    dreamcast
+    saturn
+    pcengine
+    jaguar
+    gamecube
+    amiga
+)
+
+# mkdir -p:
+#   mkdir = make directory
+#   -p    = also make missing parent directories and do not
+#           complain if the directory already exists.
+mkdir -p \
+    "$BAREFRONT_DIR/emulators" \
+    "$BAREFRONT_DIR/logs"
+
+CONTENT_LAYOUT_HELPER="$BAREFRONT_DIR/scripts/manage_content_layout.sh"
+
+if [[ ! -x "$CONTENT_LAYOUT_HELPER" ]]; then
+    die "BareFront content-layout helper is missing or not executable: $CONTENT_LAYOUT_HELPER"
+fi
+
+echo "Creating/verifying managed Local content layout..."
+
+if ! "$CONTENT_LAYOUT_HELPER" "$BAREFRONT_DIR"; then
+    die "BareFront managed Local content layout failed."
+fi
+
+echo "Managed Local content layout: OK"
+echo
+
+for system in "${SYSTEM_KEYS[@]}"; do
+    mkdir -p \
+        "$BAREFRONT_DIR/roms/$system" \
+        "$BAREFRONT_DIR/bios/$system" \
+        "$BAREFRONT_DIR/saves/$system" \
+        "$BAREFRONT_DIR/assets/games/$system" \
+        "$BAREFRONT_DIR/assets/videos/$system"
+done
+
+echo "Created/verified:"
+echo "  roms/<system>/"
+echo "  bios/<system>/"
+echo "  saves/<system>/"
+echo "  assets/games/<system>/"
+echo "  assets/videos/<system>/"
+echo
+echo "Directory stage complete."
+
+
+# ============================================================
+# Stage 2C - Optional portable-content Network Share
+# ============================================================
+
+heading "STAGE 2C / OPTIONAL NETWORK CONTENT SOURCE"
+
+NETWORK_MOUNTPOINT="${BAREFRONT_NETWORK_MOUNTPOINT:-/mnt/barefront-network}"
+NETWORK_CONFIG_DIR="${BAREFRONT_NETWORK_CONFIG_DIR:-/etc/barefront}"
+NETWORK_CREDENTIALS="${BAREFRONT_NETWORK_CREDENTIALS:-$NETWORK_CONFIG_DIR/network.credentials}"
+NETWORK_FSTAB="${BAREFRONT_NETWORK_FSTAB:-/etc/fstab}"
+NETWORK_SYSTEMCTL="${BAREFRONT_NETWORK_SYSTEMCTL:-/usr/bin/systemctl}"
+
+NETWORK_FSTAB_BEGIN="# BEGIN BAREFRONT NETWORK CONTENT"
+NETWORK_FSTAB_END="# END BAREFRONT NETWORK CONTENT"
+
+NETWORK_UID="$(id -u)"
+NETWORK_GID="$(id -g)"
+NETWORK_GROUP="$(id -gn)"
+
+
+network_managed_entry_valid()
+{
+    awk \
+        -v begin="$NETWORK_FSTAB_BEGIN" \
+        -v end="$NETWORK_FSTAB_END" \
+        -v mountpoint="$NETWORK_MOUNTPOINT" \
+        -v credentials="$NETWORK_CREDENTIALS" \
+        -v uid="$NETWORK_UID" \
+        -v gid="$NETWORK_GID" \
+        '
+        $0 == begin {
+            inside = 1
+            next
+        }
+
+        $0 == end {
+            inside = 0
+            next
+        }
+
+        inside &&
+        NF >= 4 &&
+        $2 == mountpoint &&
+        $3 == "cifs" {
+            delete option
+
+            count = split($4, values, ",")
+
+            for (i = 1; i <= count; ++i) {
+                option[values[i]] = 1
+            }
+
+            credentials_option = "credentials=" credentials
+            uid_option = "uid=" uid
+            gid_option = "gid=" gid
+
+            matching_entries++
+
+            if (option["ro"] &&
+                !option["rw"] &&
+                option["noauto"] &&
+                !option["auto"] &&
+                option["user"] &&
+                !option["nouser"] &&
+                option["_netdev"] &&
+                option[credentials_option] &&
+                option[uid_option] &&
+                option[gid_option] &&
+                option["vers=3.0"] &&
+                option["cache=strict"] &&
+                option["nosuid"] &&
+                !option["suid"] &&
+                option["nodev"] &&
+                !option["dev"] &&
+                option["noexec"] &&
+                !option["exec"]) {
+                safe_entries++
+            }
+        }
+
+        END {
+            exit(matching_entries == 1 &&
+                 safe_entries == 1 ? 0 : 1)
+        }
+        ' \
+        "$NETWORK_FSTAB"
+}
+
+
+if [[ ! -f "$NETWORK_FSTAB" ]]; then
+    die "Network configuration fstab file does not exist: $NETWORK_FSTAB"
+fi
+
+
+NETWORK_BEGIN_COUNT="$(
+    grep -Fxc "$NETWORK_FSTAB_BEGIN" "$NETWORK_FSTAB" || true
+)"
+
+NETWORK_END_COUNT="$(
+    grep -Fxc "$NETWORK_FSTAB_END" "$NETWORK_FSTAB" || true
+)"
+
+
+if [[ "$NETWORK_BEGIN_COUNT" -ne "$NETWORK_END_COUNT" ||
+      "$NETWORK_BEGIN_COUNT" -gt 1 ]]
+then
+    die "BareFront Network Share configuration markers are inconsistent."
+fi
+
+
+if [[ "$NETWORK_BEGIN_COUNT" -eq 1 ]]; then
+
+    if [[ -L "$NETWORK_CREDENTIALS" ||
+          ! -f "$NETWORK_CREDENTIALS" ]]
+    then
+        die "BareFront Network Share credentials are missing or invalid: $NETWORK_CREDENTIALS"
+    fi
+
+    if [[ "$(stat -c '%U' "$NETWORK_CREDENTIALS")" != "root" ||
+          "$(stat -c '%G' "$NETWORK_CREDENTIALS")" != "$NETWORK_GROUP" ||
+          "$(stat -c '%a' "$NETWORK_CREDENTIALS")" != "640" ]]
+    then
+        die "BareFront Network Share credentials have unexpected ownership or permissions."
+    fi
+
+    if [[ -L "$NETWORK_MOUNTPOINT" ||
+          ! -d "$NETWORK_MOUNTPOINT" ]]
+    then
+        die "BareFront Network Share mountpoint is missing or invalid: $NETWORK_MOUNTPOINT"
+    fi
+
+    if ! network_managed_entry_valid; then
+        die "Existing BareFront Network Share fstab entry is invalid."
+    fi
+
+    echo "Existing BareFront Network Share configuration found."
+    echo "Action: PRESERVE"
+
+    if ! sudo "$NETWORK_SYSTEMCTL" daemon-reload; then
+        die "systemd daemon-reload failed."
+    fi
+
+else
+
+    echo "BareFront can optionally use an SMB/CIFS share containing:"
+    echo
+    echo "  barefront/"
+    echo "    roms/"
+    echo "    bios/"
+    echo
+    echo "Local content remains the default and a Network Share is"
+    echo "NOT required."
+    echo
+
+    read -r -p \
+        "Configure a Network Share content source? [y/N] " \
+        network_reply
+
+    network_reply="${network_reply:-N}"
+
+    if [[ "$network_reply" =~ ^[Yy]$ ]]; then
+
+        if grep -v '^[[:space:]]*#' "$NETWORK_FSTAB" |
+           awk \
+               -v mountpoint="$NETWORK_MOUNTPOINT" \
+               'NF >= 2 && $2 == mountpoint { found = 1 }
+                END { exit(found ? 0 : 1) }'
+        then
+            die "An unmanaged fstab entry already uses $NETWORK_MOUNTPOINT"
+        fi
+
+        if [[ -e "$NETWORK_CREDENTIALS" ||
+              -L "$NETWORK_CREDENTIALS" ]]
+        then
+            die "Unmanaged Network Share credentials already exist: $NETWORK_CREDENTIALS"
+        fi
+
+        if [[ -e "$NETWORK_MOUNTPOINT" ||
+              -L "$NETWORK_MOUNTPOINT" ]]
+        then
+            die "Unmanaged Network Share mountpoint already exists: $NETWORK_MOUNTPOINT"
+        fi
+
+        if [[ -L "$NETWORK_CONFIG_DIR" ]]; then
+            die "Network configuration directory must not be a symlink: $NETWORK_CONFIG_DIR"
+        fi
+
+        echo
+        echo "Enter the SMB share which CONTAINS the barefront folder."
+        echo "Example:"
+        echo "  //server/share"
+        echo
+
+        read -r -p "SMB share: " NETWORK_SHARE
+
+        if [[ ! "$NETWORK_SHARE" =~ ^//[^/[:space:]]+/[^/[:space:]]+$ ]]
+        then
+            die "SMB share must use the form //server/share with no spaces."
+        fi
+
+        read -r -p "SMB username: " NETWORK_USERNAME
+
+        if [[ -z "$NETWORK_USERNAME" ]]; then
+            die "SMB username cannot be empty."
+        fi
+
+        IFS= read -r -s -p "SMB password: " NETWORK_PASSWORD
+        echo
+
+        IFS= read -r -s -p "Confirm SMB password: " NETWORK_PASSWORD_CONFIRM
+        echo
+
+        if [[ "$NETWORK_PASSWORD" != "$NETWORK_PASSWORD_CONFIRM" ]]; then
+            NETWORK_PASSWORD=""
+            NETWORK_PASSWORD_CONFIRM=""
+
+            die "SMB passwords did not match."
+        fi
+
+
+        NETWORK_CREDENTIAL_TMP="$(mktemp)"
+        NETWORK_FSTAB_ORIGINAL="$(mktemp)"
+        NETWORK_FSTAB_CANDIDATE="$(mktemp)"
+
+        NETWORK_CONFIG_DIR_CREATED=0
+        NETWORK_MOUNTPOINT_CREATED=0
+        NETWORK_CREDENTIALS_INSTALLED=0
+        NETWORK_FSTAB_INSTALLED=0
+
+
+        network_cleanup_temp()
+        {
+            rm -f \
+                "$NETWORK_CREDENTIAL_TMP" \
+                "$NETWORK_FSTAB_ORIGINAL" \
+                "$NETWORK_FSTAB_CANDIDATE"
+        }
+
+
+        network_rollback_install()
+        {
+            if [[ "$NETWORK_FSTAB_INSTALLED" -eq 1 ]]; then
+                sudo install \
+                    -o root \
+                    -g root \
+                    -m 0644 \
+                    "$NETWORK_FSTAB_ORIGINAL" \
+                    "$NETWORK_FSTAB" \
+                    >/dev/null 2>&1 ||
+                    true
+            fi
+
+            if [[ "$NETWORK_CREDENTIALS_INSTALLED" -eq 1 ]]; then
+                sudo rm -f \
+                    "$NETWORK_CREDENTIALS" \
+                    >/dev/null 2>&1 ||
+                    true
+            fi
+
+            if [[ "$NETWORK_MOUNTPOINT_CREATED" -eq 1 ]]; then
+                sudo rmdir \
+                    "$NETWORK_MOUNTPOINT" \
+                    >/dev/null 2>&1 ||
+                    true
+            fi
+
+            if [[ "$NETWORK_CONFIG_DIR_CREATED" -eq 1 ]]; then
+                sudo rmdir \
+                    "$NETWORK_CONFIG_DIR" \
+                    >/dev/null 2>&1 ||
+                    true
+            fi
+
+            if [[ "$NETWORK_FSTAB_INSTALLED" -eq 1 ]]; then
+                sudo "$NETWORK_SYSTEMCTL" daemon-reload \
+                    >/dev/null 2>&1 ||
+                    true
+            fi
+
+            network_cleanup_temp
+        }
+
+
+        chmod 600 \
+            "$NETWORK_CREDENTIAL_TMP" \
+            "$NETWORK_FSTAB_ORIGINAL" \
+            "$NETWORK_FSTAB_CANDIDATE"
+
+        printf 'username=%s\npassword=%s\n' \
+            "$NETWORK_USERNAME" \
+            "$NETWORK_PASSWORD" \
+            > "$NETWORK_CREDENTIAL_TMP"
+
+        NETWORK_PASSWORD=""
+        NETWORK_PASSWORD_CONFIRM=""
+
+        cp -- "$NETWORK_FSTAB" "$NETWORK_FSTAB_ORIGINAL"
+        cp -- "$NETWORK_FSTAB" "$NETWORK_FSTAB_CANDIDATE"
+
+        {
+            echo
+            echo "$NETWORK_FSTAB_BEGIN"
+
+            printf '%s %s cifs %s 0 0\n' \
+                "$NETWORK_SHARE" \
+                "$NETWORK_MOUNTPOINT" \
+                "ro,noauto,user,_netdev,credentials=$NETWORK_CREDENTIALS,uid=$NETWORK_UID,gid=$NETWORK_GID,vers=3.0,cache=strict,nosuid,nodev,noexec"
+
+            echo "$NETWORK_FSTAB_END"
+        } >> "$NETWORK_FSTAB_CANDIDATE"
+
+        echo
+        echo "Validating generated fstab configuration..."
+
+        if ! findmnt \
+            --verify \
+            --tab-file "$NETWORK_FSTAB_CANDIDATE"
+        then
+            network_cleanup_temp
+            die "Generated Network Share fstab configuration is invalid."
+        fi
+
+        echo "Installing protected Network Share configuration..."
+
+        if [[ ! -d "$NETWORK_CONFIG_DIR" ]]; then
+            if ! sudo install \
+                -d \
+                -o root \
+                -g root \
+                -m 0755 \
+                "$NETWORK_CONFIG_DIR"
+            then
+                network_cleanup_temp
+                die "Could not create BareFront system configuration directory."
+            fi
+
+            NETWORK_CONFIG_DIR_CREATED=1
+        fi
+
+        if ! sudo install \
+            -d \
+            -o root \
+            -g root \
+            -m 0755 \
+            "$NETWORK_MOUNTPOINT"
+        then
+            network_rollback_install
+            die "Could not create BareFront Network Share mountpoint."
+        fi
+
+        NETWORK_MOUNTPOINT_CREATED=1
+
+        if ! sudo install \
+            -o root \
+            -g "$NETWORK_GROUP" \
+            -m 0640 \
+            "$NETWORK_CREDENTIAL_TMP" \
+            "$NETWORK_CREDENTIALS"
+        then
+            network_rollback_install
+            die "Could not install Network Share credentials."
+        fi
+
+        NETWORK_CREDENTIALS_INSTALLED=1
+
+        if ! sudo install \
+            -o root \
+            -g root \
+            -m 0644 \
+            "$NETWORK_FSTAB_CANDIDATE" \
+            "$NETWORK_FSTAB"
+        then
+            network_rollback_install
+            die "Could not install BareFront Network Share fstab entry."
+        fi
+
+        NETWORK_FSTAB_INSTALLED=1
+
+        if ! sudo "$NETWORK_SYSTEMCTL" daemon-reload; then
+            echo "daemon-reload failed; rolling back Network Share configuration..."
+
+            network_rollback_install
+
+            die "systemd daemon-reload failed; Network Share configuration rolled back."
+        fi
+
+        network_cleanup_temp
+
+        echo
+        echo "Network Share configuration installed."
+        echo "Mountpoint:"
+        echo "  $NETWORK_MOUNTPOINT"
+        echo
+        echo "BareFront will mount it only when checking content sources."
+
+    else
+
+        echo
+        echo "Network Share configuration skipped."
+        echo "Local and External Media sources remain available."
+
+    fi
+fi
+
+
+# ============================================================
+# Stage 3A - Debian-managed emulators
+# ============================================================
+
+heading "STAGE 3A / DEBIAN EMULATORS"
+
+echo "These emulators come directly from Debian 13 packages."
+echo
+echo "For each emulator BareFront will:"
+echo "  1. check whether its Debian package is already installed"
+echo "  2. install it only if necessary"
+echo "  3. verify the executable exists"
+echo
+
+SUCCESS_COUNT=0
+FAILED_COUNT=0
+SKIPPED_SPECIAL=0
+
+
+# ------------------------------------------------------------
+# Stella - Atari 2600
+# ------------------------------------------------------------
+
+if install_debian_emulator \
+    "Atari 2600 / Stella" \
+    "stella" \
+    "/usr/bin/stella"
+then
+    ((SUCCESS_COUNT+=1))
+else
+    ((FAILED_COUNT+=1))
+fi
+
+STELLA_BASE_DIR="$BAREFRONT_DIR/saves/atari2600/stella"
+STELLA_CONFIG="$STELLA_BASE_DIR/stella.sqlite3"
+STELLA_LAUNCHER="$BAREFRONT_DIR/scripts/launch_stella.sh"
+STELLA_OVERLAY="$BAREFRONT_DIR/assets/overlays/atari2600.png"
+
+mkdir -p "$STELLA_BASE_DIR"
+
+echo
+echo "Creating/verifying BareFront Stella baseline..."
+
+if [[ -f "$STELLA_CONFIG" ]]; then
+
+    echo "Existing Stella configuration found."
+    echo "BareFront will not overwrite it:"
+    echo "  $STELLA_CONFIG"
+    echo "Action: PRESERVE USER CONFIG"
+
+else
+
+    python3 - "$STELLA_CONFIG" <<'PYSTELLA'
+import sqlite3
+import sys
+from pathlib import Path
+
+db = Path(sys.argv[1])
+
+con = sqlite3.connect(db)
+con.execute(
+    "CREATE TABLE settings "
+    "(setting TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID"
+)
+con.execute(
+    "INSERT INTO settings(setting, value) VALUES (?, ?)",
+    ("stella.version", "7.0")
+)
+con.commit()
+con.close()
+PYSTELLA
+
+    echo "BareFront Stella baseline created:"
+    echo "  $STELLA_CONFIG"
+    echo
+    echo "  What's New popup: suppressed"
+    echo "  Save states: $STELLA_BASE_DIR/state"
+    echo "  Action: CREATE BASELINE"
+
+fi
+
+
+if [[ ! -f "$STELLA_LAUNCHER" ]]; then
+    die "Tracked Atari 2600 launcher missing: $STELLA_LAUNCHER"
+fi
+
+chmod +x "$STELLA_LAUNCHER"
+
+if [[ ! -x "$STELLA_LAUNCHER" ]]; then
+    die "Atari 2600 launcher is not executable: $STELLA_LAUNCHER"
+fi
+
+if [[ ! -s "$STELLA_OVERLAY" ]]; then
+    die "Atari 2600 overlay is missing: $STELLA_OVERLAY"
+fi
+
+
+# ------------------------------------------------------------
+# Stella Share exit helper — Xbox Share
+# ------------------------------------------------------------
+
+STELLA_GUIDE_SOURCE="$BAREFRONT_DIR/src/stella_guide_exit_helper.cpp"
+STELLA_GUIDE_DIR="$BAREFRONT_DIR/emulators/stella"
+STELLA_GUIDE_HELPER="$STELLA_GUIDE_DIR/stella_guide_exit_helper"
+
+if [[ ! -f "$STELLA_GUIDE_SOURCE" ]]; then
+    die "Stella Share helper source is missing: $STELLA_GUIDE_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v sdl2-config >/dev/null 2>&1
+then
+    die "Stella Share helper build dependencies are missing."
+fi
+
+mkdir -p "$STELLA_GUIDE_DIR"
+
+if [[ ! -x "$STELLA_GUIDE_HELPER" ]] ||
+   [[ "$STELLA_GUIDE_SOURCE" -nt "$STELLA_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building Stella Xbox Share exit helper..."
+
+    STELLA_GUIDE_CANDIDATE="$(
+        mktemp "$STELLA_GUIDE_DIR/.stella-guide-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 \
+        "$STELLA_GUIDE_SOURCE" \
+        -o "$STELLA_GUIDE_CANDIDATE" \
+        $(sdl2-config --cflags --libs) \
+        -lX11 -lXtst
+    then
+        rm -f -- "$STELLA_GUIDE_CANDIDATE"
+        die "Stella Share helper compilation failed."
+    fi
+
+    chmod 755 "$STELLA_GUIDE_CANDIDATE"
+    mv -fT "$STELLA_GUIDE_CANDIDATE" "$STELLA_GUIDE_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo
+    echo "Stella Share exit helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$STELLA_GUIDE_HELPER" ]]; then
+    die "Stella Share exit helper build failed."
+fi
+
+
+# ------------------------------------------------------------
+# Mednafen - Mega Drive + Saturn + PC Engine
+# One emulator package services three BareFront systems.
+# ------------------------------------------------------------
+
+if install_debian_emulator \
+    "Mega Drive + Saturn + PC Engine / Mednafen" \
+    "mednafen" \
+    "/usr/games/mednafen"
+then
+    ((SUCCESS_COUNT+=1))
+else
+    ((FAILED_COUNT+=1))
+fi
+
+
+# ------------------------------------------------------------
+# MAME - Arcade + Neo Geo
+# One emulator package services two BareFront systems.
+# ------------------------------------------------------------
+
+if install_debian_emulator \
+    "Arcade + Neo Geo / MAME" \
+    "mame" \
+    "/usr/games/mame"
+then
+    ((SUCCESS_COUNT+=1))
+else
+    ((FAILED_COUNT+=1))
+fi
+
+
+# ------------------------------------------------------------
+# Dolphin - GameCube
+# ------------------------------------------------------------
+
+if install_debian_emulator \
+    "GameCube / Dolphin" \
+    "dolphin-emu" \
+    "/usr/games/dolphin-emu"
+then
+    ((SUCCESS_COUNT+=1))
+else
+    ((FAILED_COUNT+=1))
+fi
+
+
+# ============================================================
+# VICE special case
+#
+# Debian 13 places VICE in the "contrib" component.
+#
+# Rather than modifying the user's existing Debian repository
+# file, BareFront can create its own small supplemental source:
+#
+#   /etc/apt/sources.list.d/barefront-contrib.sources
+#
+# This is easy to identify and easy to reverse later.
+# ============================================================
+
+enable_barefront_contrib()
+{
+    local source_file="/etc/apt/sources.list.d/barefront-contrib.sources"
+
+    echo
+    echo "VICE needs Debian's 'contrib' repository component."
+    echo
+    echo "BareFront can enable contrib by creating:"
+    echo "  $source_file"
+    echo
+    echo "Your existing Debian source files will NOT be edited."
+    echo
+    echo "To reverse this later you can remove that one file and run:"
+    echo "  sudo apt-get update"
+    echo
+
+    read -r -p "Enable Debian contrib for BareFront? [Y/n] " reply
+    reply="${reply:-Y}"
+
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        echo "User chose not to enable contrib."
+        return 1
+    fi
+
+    # tee reads text from standard input and writes it to a file.
+    # sudo is attached to tee because /etc/apt belongs to root.
+    sudo tee "$source_file" >/dev/null <<'EOF'
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: contrib
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.debian.org/debian-security
+Suites: trixie-security
+Components: contrib
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+
+    echo
+    echo "Created:"
+    echo "  $source_file"
+    echo
+    echo "Refreshing APT after enabling contrib..."
+
+    if ! sudo apt-get update; then
+        echo "APT update failed after enabling contrib."
+        return 1
+    fi
+
+    return 0
+}
+
+
+echo
+echo "------------------------------------------------"
+echo "Commodore 64 / VICE"
+echo "------------------------------------------------"
+
+if package_is_installed "vice"; then
+
+    echo "VICE is already installed."
+    echo "  Action: SKIP"
+
+    if [[ -x /usr/bin/x64sc ]]; then
+        echo "Executable verified:"
+        echo "  /usr/bin/x64sc"
+        ((SUCCESS_COUNT+=1))
+    else
+        echo "FAILED: VICE package exists but /usr/bin/x64sc is missing."
+        ((FAILED_COUNT+=1))
+    fi
+
+else
+
+    # apt-cache policy asks APT which version it would install.
+    # Candidate: (none) means none of the configured repositories
+    # currently provides the package.
+    VICE_CANDIDATE="$(
+        apt-cache policy vice 2>/dev/null \
+        | awk '/Candidate:/ {print $2}'
+    )"
+
+    if [[ -z "$VICE_CANDIDATE" || "$VICE_CANDIDATE" == "(none)" ]]; then
+
+        echo "VICE is not currently visible to APT."
+
+        if enable_barefront_contrib; then
+
+            # Ask APT again now that contrib has been added.
+            VICE_CANDIDATE="$(
+                apt-cache policy vice 2>/dev/null \
+                | awk '/Candidate:/ {print $2}'
+            )"
+
+        else
+            VICE_CANDIDATE="(none)"
+        fi
+    fi
+
+    if [[ -n "$VICE_CANDIDATE" && "$VICE_CANDIDATE" != "(none)" ]]; then
+
+        echo
+        echo "VICE is available."
+        echo "Candidate version:"
+        echo "  $VICE_CANDIDATE"
+
+        if sudo apt-get install -y vice; then
+
+            if [[ -x /usr/bin/x64sc ]]; then
+                echo "VICE installed and verified:"
+                echo "  /usr/bin/x64sc"
+                ((SUCCESS_COUNT+=1))
+            else
+                echo "FAILED: VICE installed but x64sc was not found."
+                ((FAILED_COUNT+=1))
+            fi
+
+        else
+            echo "FAILED: APT could see VICE but installation failed."
+            ((FAILED_COUNT+=1))
+        fi
+
+    else
+        echo
+        echo "VICE was not installed."
+        echo "BareFront can continue, but Commodore 64 support"
+        echo "will remain incomplete until contrib/VICE is available."
+        ((SKIPPED_SPECIAL+=1))
+    fi
+fi
+
+
+# ============================================================
+# Stage 3A summary
+# ============================================================
+
+heading "STAGE 3A SUMMARY"
+
+echo "Debian emulator packages:"
+echo
+echo "  Successful / verified : $SUCCESS_COUNT"
+echo "  Failed                : $FAILED_COUNT"
+echo "  Deferred special case : $SKIPPED_SPECIAL"
+echo
+
+echo "Expected executable paths:"
+echo
+echo "  Stella    /usr/bin/stella"
+echo "  Mednafen  /usr/games/mednafen"
+echo "  MAME      /usr/games/mame"
+echo "  VICE      /usr/bin/x64sc"
+echo "  Dolphin   /usr/games/dolphin-emu"
+echo
+
+if [[ "$FAILED_COUNT" -gt 0 ]]; then
+    echo "One or more package-managed emulator installs failed."
+    echo "Review:"
+    echo "  $LOG_FILE"
+    exit 1
+fi
+
+if [[ "$SKIPPED_SPECIAL" -gt 0 ]]; then
+    echo "Stage 3A cannot complete."
+    echo "VICE is required for Commodore 64 support."
+    echo "Enable Debian contrib and rerun the installer."
+    exit 1
+else
+    echo "Stage 3A completed successfully."
+fi
+
+echo
+echo "Nothing in Stage 3A installs ROMs or copyrighted BIOS files."
+echo
+
+
+# ============================================================
+# Stage 3B - Mega Drive
+# Mednafen
+# ============================================================
+
+heading "STAGE 3B / MEGA DRIVE / MEDNAFEN"
+
+MEDNAFEN_MD_EXE="/usr/games/mednafen"
+MEDNAFEN_MD_LOCAL_DIR="$BAREFRONT_DIR/emulators/mednafen"
+MEDNAFEN_MD_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mednafen_md.sh"
+MEDNAFEN_MD_CONTROL_SOURCE="$BAREFRONT_DIR/src/megadrive_controller_helper.cpp"
+MEDNAFEN_MD_CONTROL_HELPER="$MEDNAFEN_MD_LOCAL_DIR/megadrive_controller_helper"
+MEDNAFEN_MD_PROFILE="$BAREFRONT_DIR/saves/megadrive/mednafen"
+MEDNAFEN_MD_CONFIG="$MEDNAFEN_MD_PROFILE/mednafen.cfg"
+
+MEDNAFEN_MD_BARECRT_DIR="$BAREFRONT_DIR/assets/shaders/barecrt"
+MEDNAFEN_MD_BARECRT_SHADER="$MEDNAFEN_MD_BARECRT_DIR/BareCRT_v2.fx"
+MEDNAFEN_MD_RESHADE_INCLUDE="$MEDNAFEN_MD_BARECRT_DIR/ReShade.fxh"
+MEDNAFEN_MD_OVERLAY="$BAREFRONT_DIR/assets/overlays/megadrive.png"
+
+VKBASALT_LAYER="/usr/share/vulkan/implicit_layer.d/vkBasalt.json"
+
+echo "Configuring BareFront Mega Drive integration..."
+echo
+
+if [[ ! -x "$MEDNAFEN_MD_EXE" ]]; then
+    die "Mednafen executable not found: $MEDNAFEN_MD_EXE"
+fi
+
+if [[ ! -f "$MEDNAFEN_MD_LAUNCHER" ]]; then
+    die "Tracked Mega Drive launcher missing: $MEDNAFEN_MD_LAUNCHER"
+fi
+
+chmod +x "$MEDNAFEN_MD_LAUNCHER"
+
+if [[ ! -x "$MEDNAFEN_MD_LAUNCHER" ]]; then
+    die "Mega Drive launcher is not executable."
+fi
+
+if [[ ! -x "$GAMESCOPE_EXE" ]]; then
+    die "Mega Drive presentation requires Gamescope: $GAMESCOPE_EXE"
+fi
+
+if [[ ! -f "$VKBASALT_LAYER" ]]; then
+    die "vkBasalt Vulkan layer is missing: $VKBASALT_LAYER"
+fi
+
+if [[ ! -s "$MEDNAFEN_MD_BARECRT_SHADER" ]]; then
+    die "BareCRT shader is missing: $MEDNAFEN_MD_BARECRT_SHADER"
+fi
+
+if [[ ! -s "$MEDNAFEN_MD_RESHADE_INCLUDE" ]]; then
+    die "BareCRT ReShade include is missing: $MEDNAFEN_MD_RESHADE_INCLUDE"
+fi
+
+if [[ ! -s "$MEDNAFEN_MD_OVERLAY" ]]; then
+    die "Mega Drive overlay artwork is missing: $MEDNAFEN_MD_OVERLAY"
+fi
+
+mkdir -p \
+    "$MEDNAFEN_MD_LOCAL_DIR" \
+    "$MEDNAFEN_MD_PROFILE" \
+    "$BAREFRONT_DIR/roms/megadrive" \
+    "$BAREFRONT_DIR/saves/megadrive" \
+    "$BAREFRONT_DIR/assets/games/megadrive" \
+    "$BAREFRONT_DIR/assets/videos/megadrive"
+
+if [[ ! -f "$MEDNAFEN_MD_CONFIG" ]]; then
+    echo "Creating isolated Mednafen Mega Drive profile..."
+
+    MEDNAFEN_HOME="$MEDNAFEN_MD_PROFILE" \
+        "$MEDNAFEN_MD_EXE" -help \
+        > "$LOG_DIR/mednafen-megadrive-profile.log" \
+        2>&1 || true
+
+    echo "  Action: CREATE"
+else
+    echo "Isolated Mednafen Mega Drive profile already exists."
+    echo "  Action: PRESERVE"
+fi
+
+if [[ ! -f "$MEDNAFEN_MD_CONFIG" ]]; then
+    die "Mednafen did not create the Mega Drive profile."
+fi
+
+MEDNAFEN_MD_CONFIG_PATH="$MEDNAFEN_MD_CONFIG" python3 - <<'PYMEDNAFEN_MD'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MEDNAFEN_MD_CONFIG_PATH"])
+original = path.read_text()
+lines = original.splitlines()
+
+enforced = {
+    "command.exit": "keyboard 0x0 41",
+    "md.correct_aspect": "0",
+    "md.scanlines": "0",
+    "md.shader": "none",
+    "md.stretch": "0",
+    "md.videoip": "0",
+    "md.xscale": "1.000000",
+    "md.yscale": "1.000000",
+}
+
+seen = set()
+
+for index, line in enumerate(lines):
+    parts = line.split(None, 1)
+
+    if not parts:
+        continue
+
+    key = parts[0]
+
+    if key in enforced:
+        lines[index] = f"{key} {enforced[key]}"
+        seen.add(key)
+
+for key, value in enforced.items():
+    if key not in seen:
+        lines.append(f"{key} {value}")
+
+updated = "\n".join(lines) + "\n"
+
+if updated != original:
+    path.write_text(updated)
+
+resolved = {}
+
+for line in lines:
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+for key, value in enforced.items():
+    if resolved.get(key) != value:
+        raise SystemExit(
+            f"Could not enforce Mega Drive Mednafen setting: {key}"
+        )
+
+print("  Raw 1x video profile: OK")
+print("  Esc exit binding: OK")
+PYMEDNAFEN_MD
+
+MEDNAFEN_MD_PACKAGE_VERSION="$(
+    dpkg-query -W -f='${Version}' mednafen 2>/dev/null || true
+)"
+
+cat > "$MEDNAFEN_MD_LOCAL_DIR/MEGADRIVE_VERSION.txt" <<EOF
+BareFront managed emulator integration
+System: Mega Drive / Genesis
+Emulator: Mednafen
+Package version: ${MEDNAFEN_MD_PACKAGE_VERSION:-Unknown}
+Executable: $MEDNAFEN_MD_EXE
+BareFront launcher: $MEDNAFEN_MD_LAUNCHER
+BareFront profile: $MEDNAFEN_MD_PROFILE
+Presentation: Gamescope integer scaling + external BareCRT
+EOF
+
+echo
+echo "Mega Drive integration:"
+echo "  Emulator: Mednafen"
+echo "  Raw H40:  320x224"
+echo "  Raw H32:  256x224 within the 320x224 presentation surface"
+echo "  Gamescope output: 1280x896"
+echo "  Audio: BareFront-selected HDMI -> direct ALSA / 48 kHz / 20 ms"
+echo "  Esc: direct return to BareFront"
+
+# ------------------------------------------------------------
+# Mega Drive Xbox Guide hold helper
+# ------------------------------------------------------------
+
+echo
+echo "Installing/verifying Mega Drive controller helper..."
+
+if [[ ! -f "$MEDNAFEN_MD_CONTROL_SOURCE" ]]; then
+    die "Mega Drive controller helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    echo
+    echo "Installing Mega Drive controller helper build dependencies..."
+
+    if ! sudo apt-get install -y \
+        g++ \
+        pkg-config \
+        libsdl2-dev \
+        libx11-dev \
+        libxtst-dev
+    then
+        die "Could not install Mega Drive controller helper build dependencies."
+    fi
+fi
+
+if [[ ! -x "$MEDNAFEN_MD_CONTROL_HELPER" ]] ||
+   [[ "$MEDNAFEN_MD_CONTROL_SOURCE" -nt "$MEDNAFEN_MD_CONTROL_HELPER" ]]
+then
+    echo
+    echo "Building Mega Drive controller helper..."
+
+    MEDNAFEN_MD_CONTROL_CANDIDATE="$(
+        mktemp "$MEDNAFEN_MD_LOCAL_DIR/.megadrive-controller-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$MEDNAFEN_MD_CONTROL_SOURCE" \
+        -o "$MEDNAFEN_MD_CONTROL_CANDIDATE" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$MEDNAFEN_MD_CONTROL_CANDIDATE"
+        die "Mega Drive controller helper compilation failed."
+    fi
+
+    chmod 755 "$MEDNAFEN_MD_CONTROL_CANDIDATE"
+
+    mv -fT \
+        "$MEDNAFEN_MD_CONTROL_CANDIDATE" \
+        "$MEDNAFEN_MD_CONTROL_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo "Mega Drive controller helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$MEDNAFEN_MD_CONTROL_HELPER" ]]; then
+    die "Mega Drive controller helper verification failed."
+fi
+
+echo "  Mega Drive controller helper: OK"
+echo
+echo "Mega Drive stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Mesen Community Edition
+# ============================================================
+
+heading "STAGE 3B / MESEN"
+
+MESEN_DIR="$BAREFRONT_DIR/emulators/mesen"
+MESEN_EXE="$MESEN_DIR/Mesen"
+MESEN_NES_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mesen_nes.sh"
+MESEN_SMS_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mesen_sms.sh"
+MESEN_SMS_OVERLAY="$BAREFRONT_DIR/assets/overlays/mastersystem.png"
+MESEN_MENU_NUDGE_SOURCE="$BAREFRONT_DIR/src/mesen_menu_nudge_helper.cpp"
+MESEN_MENU_NUDGE_HELPER="$MESEN_DIR/mesen_menu_nudge_helper"
+MESEN_GUIDE_EXIT_SOURCE="$BAREFRONT_DIR/src/mesen_guide_exit_helper.cpp"
+MESEN_GUIDE_EXIT_HELPER="$MESEN_DIR/mesen_guide_exit_helper"
+
+# BareFront-tested MesenCE release.
+MESEN_VERSION="2.2.1"
+MESEN_CONFIG_UPGRADE="5"
+MESEN_ASSET_NAME_EXPECTED="Mesen_2.2.1_Linux_x64.zip"
+MESEN_EXPECTED_SHA256="c88ff4d251b407515c43d3332d641927655cd69fb538996b6a21da4509dbb58f"
+MESEN_EXPECTED_EXE_SHA256="64bc63dc04ae9dfe78fc6089155d5321b68fd4e5198b3c973a80532a8e285334"
+
+MESEN_API="https://api.github.com/repos/nesdev-org/MesenCE/releases/tags/$MESEN_VERSION"
+
+MESEN_CONFIG_DIR="$HOME/.config/MesenCE"
+MESEN_CONFIG="$MESEN_CONFIG_DIR/settings.json"
+MESEN_SAVE_DIR="$BAREFRONT_DIR/saves/mesen"
+
+echo "BareFront uses Mesen for:"
+echo "  NES"
+echo "  Master System"
+echo
+echo "Install location:"
+echo "  $MESEN_DIR"
+echo
+
+MESEN_INSTALLED_RELEASE="$(
+    sed -n 's/^Release: //p' "$MESEN_DIR/VERSION.txt" 2>/dev/null         | head -1 || true
+)"
+
+MESEN_INSTALLED_SHA256=""
+
+if [[ -f "$MESEN_EXE" ]]; then
+    MESEN_INSTALLED_SHA256="$(
+        sha256sum "$MESEN_EXE" |
+            awk '{print $1}'
+    )"
+fi
+
+if [[ -x "$MESEN_EXE" &&
+      "$MESEN_INSTALLED_RELEASE" == "$MESEN_VERSION" &&
+      "$MESEN_INSTALLED_SHA256" == "$MESEN_EXPECTED_EXE_SHA256" ]]; then
+
+    echo "Pinned MesenCE release is already installed."
+    echo "Release:"
+    echo "  $MESEN_INSTALLED_RELEASE"
+    echo "Executable:"
+    echo "  $MESEN_EXE"
+    echo "Executable SHA-256:"
+    echo "  $MESEN_INSTALLED_SHA256"
+    echo "Action: SKIP"
+
+else
+
+    if [[ -x "$MESEN_EXE" ]]; then
+        echo "Existing Mesen installation is not the BareFront-pinned release."
+        echo "Action: INSTALL PINNED RELEASE"
+        echo
+    fi
+
+    mkdir -p "$MESEN_DIR"
+
+    echo "Requesting BareFront-pinned MesenCE release from GitHub..."
+    echo
+
+    # curl:
+    #   -f = fail if the web server returns an HTTP error
+    #   -s = silent progress meter
+    #   -S = still show an error if something fails
+    #   -L = follow redirects
+    #
+    # BareFront requests the exact tested release tag rather than
+    # following MesenCE's latest release automatically.
+    if ! MESEN_RELEASE_JSON="$(curl -fsSL "$MESEN_API")"; then
+        die "Could not retrieve the latest stable MesenCE release information."
+    fi
+
+    MESEN_RELEASE_TAG="$(
+        printf '%s' "$MESEN_RELEASE_JSON" \
+        | jq -r '.tag_name // empty'
+    )"
+
+    if [[ "$MESEN_RELEASE_TAG" != "$MESEN_VERSION" ]]; then
+        die "GitHub did not return the pinned MesenCE release."
+    fi
+
+    echo "Pinned stable release:"
+    echo "  $MESEN_VERSION"
+    echo
+
+    # --------------------------------------------------------
+    # Select the exact BareFront-tested Linux x64 archive.
+    # --------------------------------------------------------
+
+    MESEN_ASSET_JSON="$(
+        printf '%s' "$MESEN_RELEASE_JSON" \
+        | jq -c --arg asset "$MESEN_ASSET_NAME_EXPECTED" '
+            [
+              .assets[]
+              | select(.name == $asset)
+            ][0] // empty
+          '
+    )"
+
+    if [[ -z "$MESEN_ASSET_JSON" ]]; then
+        die "Could not find the BareFront-tested MesenCE Linux x64 archive."
+    fi
+
+    MESEN_ASSET_NAME="$(
+        printf '%s' "$MESEN_ASSET_JSON" \
+        | jq -r '.name'
+    )"
+
+    MESEN_DOWNLOAD_URL="$(
+        printf '%s' "$MESEN_ASSET_JSON" \
+        | jq -r '.browser_download_url'
+    )"
+
+    MESEN_DIGEST="$(
+        printf '%s' "$MESEN_ASSET_JSON" \
+        | jq -r '.digest // empty'
+    )"
+
+    echo
+    echo "Selected release asset:"
+    echo "  $MESEN_ASSET_NAME"
+
+    if [[ "$MESEN_ASSET_NAME" != "$MESEN_ASSET_NAME_EXPECTED" ]]; then
+        die "GitHub did not return the expected BareFront-tested MesenCE asset."
+    fi
+
+    TEMP_DIR="$(mktemp -d)"
+    TEMP_DOWNLOAD="$TEMP_DIR/mesen-download"
+
+    echo
+    echo "Downloading..."
+
+    if ! curl -fL --progress-bar \
+        "$MESEN_DOWNLOAD_URL" \
+        -o "$TEMP_DOWNLOAD"
+    then
+        rm -rf "$TEMP_DIR"
+        die "MesenCE download failed."
+    fi
+
+    # --------------------------------------------------------
+    # BareFront pinned SHA-256 verification.
+    #
+    # This is the exact Linux x64 archive accepted during
+    # BareFront integration testing.
+    # --------------------------------------------------------
+
+    ACTUAL_PINNED_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+    echo
+    echo "Checking BareFront pinned SHA-256..."
+
+    if [[ "$ACTUAL_PINNED_SHA256" != "$MESEN_EXPECTED_SHA256" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "MesenCE does not match the BareFront-tested SHA-256."
+    fi
+
+    echo "  SHA-256: OK"
+
+    # --------------------------------------------------------
+    # Verify SHA-256 when GitHub publishes one for the asset.
+    # --------------------------------------------------------
+
+    if [[ "$MESEN_DIGEST" == sha256:* ]]; then
+
+        EXPECTED_SHA256="${MESEN_DIGEST#sha256:}"
+        ACTUAL_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+        echo
+        echo "Checking download SHA-256..."
+
+        if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+            rm -rf "$TEMP_DIR"
+            die "MesenCE SHA-256 verification failed."
+        fi
+
+        echo "  SHA-256: OK"
+
+    else
+
+        echo
+        echo "GitHub did not publish an asset SHA-256 digest."
+        echo "Download came directly from the official MesenCE release."
+    fi
+
+    # --------------------------------------------------------
+    # Work out what kind of file GitHub gave us.
+    #
+    # `file` examines the CONTENTS of a file rather than trusting
+    # its filename extension.
+    # --------------------------------------------------------
+
+    DOWNLOAD_TYPE="$(file -b "$TEMP_DOWNLOAD")"
+
+    echo
+    echo "Downloaded file type:"
+    echo "  $DOWNLOAD_TYPE"
+
+    EXTRACT_DIR="$TEMP_DIR/extracted"
+    mkdir -p "$EXTRACT_DIR"
+
+    MESEN_INSTALL_SOURCE=""
+
+    if grep -qi "Zip archive" <<< "$DOWNLOAD_TYPE"; then
+
+        echo "Extracting ZIP archive..."
+        unzip -q "$TEMP_DOWNLOAD" -d "$EXTRACT_DIR"
+
+        FOUND_MESEN="$(
+            find "$EXTRACT_DIR" \
+                -type f \
+                -name 'Mesen' \
+                -print \
+                -quit
+        )"
+
+        if [[ -z "$FOUND_MESEN" ]]; then
+            rm -rf "$TEMP_DIR"
+            die "Mesen executable was not found inside the downloaded ZIP."
+        fi
+
+        MESEN_INSTALL_SOURCE="$FOUND_MESEN"
+
+    elif grep -qiE "ELF .* executable|AppImage|executable" <<< "$DOWNLOAD_TYPE"; then
+
+        echo "Downloaded asset is directly executable."
+        MESEN_INSTALL_SOURCE="$TEMP_DOWNLOAD"
+
+    else
+
+        echo
+        echo "Unexpected download format:"
+        echo "  $DOWNLOAD_TYPE"
+        rm -rf "$TEMP_DIR"
+        die "BareFront does not yet know how to unpack this MesenCE release asset."
+    fi
+
+    MESEN_INSTALL_CANDIDATE="$(
+        mktemp "$MESEN_DIR/.Mesen-install.XXXXXX"
+    )"
+
+    if ! cp "$MESEN_INSTALL_SOURCE" "$MESEN_INSTALL_CANDIDATE"; then
+        rm -f -- "$MESEN_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not stage the pinned Mesen executable."
+    fi
+
+    chmod 0755 "$MESEN_INSTALL_CANDIDATE"
+
+    MESEN_CANDIDATE_SHA256="$(
+        sha256sum "$MESEN_INSTALL_CANDIDATE" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$MESEN_CANDIDATE_SHA256" != "$MESEN_EXPECTED_EXE_SHA256" ]]; then
+        rm -f -- "$MESEN_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Extracted Mesen executable does not match the BareFront-tested SHA-256."
+    fi
+
+    if ! mv -fT \
+        "$MESEN_INSTALL_CANDIDATE" \
+        "$MESEN_EXE"
+    then
+        rm -f -- "$MESEN_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not promote the pinned Mesen executable."
+    fi
+
+    # Keep a small human-readable record of what BareFront installed.
+    MESEN_VERSION_CANDIDATE="$(
+        mktemp "$MESEN_DIR/.VERSION.txt.XXXXXX"
+    )"
+
+    cat > "$MESEN_VERSION_CANDIDATE" <<EOF
+BareFront managed emulator
+Emulator: Mesen Community Edition
+Release: $MESEN_VERSION
+Source: https://github.com/nesdev-org/MesenCE
+Asset: $MESEN_ASSET_NAME
+EOF
+
+    mv -fT \
+        "$MESEN_VERSION_CANDIDATE" \
+        "$MESEN_DIR/VERSION.txt"
+
+    rm -rf "$TEMP_DIR"
+
+    echo
+    echo "Mesen installed."
+fi
+
+
+# ------------------------------------------------------------
+# Final Mesen verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying Mesen..."
+
+if [[ -x "$MESEN_EXE" ]]; then
+    echo "  Executable: OK"
+    echo "  $MESEN_EXE"
+else
+    die "Mesen installation verification failed."
+fi
+
+MESEN_FINAL_SHA256="$(
+    sha256sum "$MESEN_EXE" |
+        awk '{print $1}'
+)"
+
+if [[ "$MESEN_FINAL_SHA256" != "$MESEN_EXPECTED_EXE_SHA256" ]]; then
+    die "Installed Mesen executable failed BareFront SHA-256 verification."
+fi
+
+echo "  Executable SHA-256: OK"
+
+if [[ -f "$MESEN_DIR/VERSION.txt" ]]; then
+    echo
+    echo "BareFront install record:"
+    sed 's/^/  /' "$MESEN_DIR/VERSION.txt"
+fi
+
+if [[ ! -x "$MESEN_NES_LAUNCHER" ]]; then
+    die "Mesen NES BareFront wrapper is missing or not executable."
+fi
+
+if [[ ! -x "$MESEN_SMS_LAUNCHER" ]]; then
+    die "Mesen Master System BareFront wrapper is missing or not executable."
+fi
+
+if [[ ! -s "$MESEN_SMS_OVERLAY" ]]; then
+    die "Master System overlay artwork is missing: $MESEN_SMS_OVERLAY"
+fi
+
+if [[ ! -f "$MESEN_MENU_NUDGE_SOURCE" ]]; then
+    die "Mesen menu nudge helper source is missing."
+fi
+
+if [[ ! -x "$MESEN_MENU_NUDGE_HELPER" ]] || \
+   [[ "$MESEN_MENU_NUDGE_SOURCE" -nt "$MESEN_MENU_NUDGE_HELPER" ]]
+then
+    echo
+    echo "Building Mesen menu nudge helper..."
+
+    MESEN_MENU_NUDGE_CANDIDATE="$(
+        mktemp "$MESEN_DIR/.mesen-menu-nudge-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 \
+        "$MESEN_MENU_NUDGE_SOURCE" \
+        -o "$MESEN_MENU_NUDGE_CANDIDATE" \
+        -lX11
+    then
+        rm -f -- "$MESEN_MENU_NUDGE_CANDIDATE"
+        die "Mesen menu nudge helper compilation failed."
+    fi
+
+    chmod 0755 "$MESEN_MENU_NUDGE_CANDIDATE"
+
+    mv -fT \
+        "$MESEN_MENU_NUDGE_CANDIDATE" \
+        "$MESEN_MENU_NUDGE_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo
+    echo "Mesen menu nudge helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$MESEN_MENU_NUDGE_HELPER" ]]; then
+    die "Mesen menu nudge helper build failed."
+fi
+
+if [[ ! -f "$MESEN_GUIDE_EXIT_SOURCE" ]]; then
+    die "Mesen Share exit helper source is missing."
+fi
+
+if [[ ! -x "$MESEN_GUIDE_EXIT_HELPER" ]] || \
+   [[ "$MESEN_GUIDE_EXIT_SOURCE" -nt "$MESEN_GUIDE_EXIT_HELPER" ]]
+then
+    echo
+    echo "Building Mesen Share exit helper..."
+
+    MESEN_GUIDE_EXIT_CANDIDATE="$(
+        mktemp "$MESEN_DIR/.mesen-share-exit-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 \
+        "$MESEN_GUIDE_EXIT_SOURCE" \
+        -o "$MESEN_GUIDE_EXIT_CANDIDATE" \
+        $(sdl2-config --cflags --libs) \
+        -lX11 -lXtst
+    then
+        rm -f -- "$MESEN_GUIDE_EXIT_CANDIDATE"
+        die "Mesen Share exit helper compilation failed."
+    fi
+
+    chmod 0755 "$MESEN_GUIDE_EXIT_CANDIDATE"
+
+    mv -fT \
+        "$MESEN_GUIDE_EXIT_CANDIDATE" \
+        "$MESEN_GUIDE_EXIT_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo
+    echo "Mesen Share exit helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$MESEN_GUIDE_EXIT_HELPER" ]]; then
+    die "Mesen Share exit helper build failed."
+fi
+
+echo
+echo "Creating/verifying BareFront MesenCE baseline..."
+
+mkdir -p "$MESEN_SAVE_DIR"
+
+if [[ -f "$MESEN_CONFIG" ]]; then
+
+    echo "Existing MesenCE user configuration found."
+    echo "Preserving emulator-owned settings:"
+    echo "  $MESEN_CONFIG"
+    echo
+    echo "Enforcing BareFront-owned integration:"
+    echo "  Esc = exit directly to BareFront"
+    echo "  Emulator screenshot hotkey = unassigned"
+
+    python3 - "$MESEN_CONFIG" <<'PYMESENPRESERVE'
+import json
+import sys
+from pathlib import Path
+
+config = Path(sys.argv[1])
+
+with config.open("r", encoding="utf-8-sig") as f:
+    data = json.load(f)
+
+preferences = data.setdefault("Preferences", {})
+preferences["AutoHideMenu"] = True
+preferences["DisableOsd"] = True
+shortcuts = preferences.setdefault("ShortcutKeys", [])
+
+def set_shortcut(name, key1):
+    for item in shortcuts:
+        if item.get("Shortcut") == name:
+            item["KeyCombination"] = {
+                "Key1": key1,
+                "Key2": 0,
+                "Key3": 0,
+            }
+            item["KeyCombination2"] = {
+                "Key1": 0,
+                "Key2": 0,
+                "Key3": 0,
+            }
+            return
+
+    shortcuts.append({
+        "Shortcut": name,
+        "KeyCombination": {
+            "Key1": key1,
+            "Key2": 0,
+            "Key3": 0,
+        },
+        "KeyCombination2": {
+            "Key1": 0,
+            "Key2": 0,
+            "Key3": 0,
+        },
+    })
+
+set_shortcut("Exit", 13)
+set_shortcut("Pause", 0)
+set_shortcut("TakeScreenshot", 0)
+
+# --------------------------------------------------------
+# BareFront Xbox-compatible controller baseline
+#
+# MesenCE stores controller inputs as numeric host-key codes.
+# These values were generated by MesenCE 2.2.1 itself using
+# an Xbox Series controller.
+#
+# Only seed Port 1 when ALL normal gameplay controls are
+# unassigned. Any existing/user-customised mapping is left
+# completely untouched.
+# --------------------------------------------------------
+
+def seed_xbox_port(system_name, controller_type, mapping):
+    system = data.setdefault(system_name, {})
+    port = system.setdefault("Port1", {})
+    current = port.setdefault("Mapping1", {})
+
+    gameplay_keys = (
+        "A", "B",
+        "Up", "Down", "Left", "Right",
+        "Start", "Select",
+    )
+
+    if all((current.get(key, 0) or 0) == 0 for key in gameplay_keys):
+        port["Type"] = controller_type
+
+        for key, value in mapping.items():
+            current[key] = value
+
+
+seed_xbox_port(
+    "Nes",
+    "NesController",
+    {
+        "A": 4096,
+        "B": 4097,
+        "Up": 4125,
+        "Down": 4124,
+        "Left": 4123,
+        "Right": 4122,
+        "Start": 4107,
+        "Select": 4106,
+    },
+)
+
+seed_xbox_port(
+    "Sms",
+    "SmsController",
+    {
+        "A": 4097,
+        "B": 4096,
+        "Up": 4125,
+        "Down": 4124,
+        "Left": 4123,
+        "Right": 4122,
+        "Start": 4107,
+        "Select": 0,
+    },
+)
+
+with config.open("w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PYMESENPRESERVE
+
+    echo "Action: REPAIR BAREFRONT INTEGRATION"
+
+else
+
+    mkdir -p "$MESEN_CONFIG_DIR"
+
+    python3 - "$MESEN_CONFIG" "$MESEN_SAVE_DIR" "$MESEN_VERSION" "$MESEN_CONFIG_UPGRADE" <<'PYMESEN'
+import json
+import sys
+from pathlib import Path
+
+config = Path(sys.argv[1])
+save_dir = sys.argv[2]
+version = sys.argv[3]
+config_upgrade = int(sys.argv[4])
+
+data = {
+    "Version": version,
+    "ConfigUpgrade": config_upgrade,
+    "Preferences": {
+        "AutomaticallyCheckForUpdates": False,
+        "AutoHideMenu": True,
+        "DisableOsd": True,
+
+        "OverrideSaveDataFolder": True,
+        "SaveDataFolder": save_dir,
+
+        "OverrideSaveStateFolder": True,
+        "SaveStateFolder": save_dir,
+
+        "ShortcutKeys": [
+            {
+                "Shortcut": "TakeScreenshot",
+                "KeyCombination": {
+                    "Key1": 0,
+                    "Key2": 0,
+                    "Key3": 0
+                },
+                "KeyCombination2": {
+                    "Key1": 0,
+                    "Key2": 0,
+                    "Key3": 0
+                }
+            },
+            {
+                "Shortcut": "Exit",
+                "KeyCombination": {
+                    "Key1": 13,
+                    "Key2": 0,
+                    "Key3": 0
+                },
+                "KeyCombination2": {
+                    "Key1": 0,
+                    "Key2": 0,
+                    "Key3": 0
+                }
+            },
+            {
+                "Shortcut": "Pause",
+                "KeyCombination": {
+                    "Key1": 0,
+                    "Key2": 0,
+                    "Key3": 0
+                },
+                "KeyCombination2": {
+                    "Key1": 0,
+                    "Key2": 0,
+                    "Key3": 0
+                }
+            }
+        ]
+    }
+}
+
+# --------------------------------------------------------
+# BareFront Xbox-compatible controller baseline
+#
+# MesenCE stores controller inputs as numeric host-key codes.
+# These values were generated by MesenCE 2.2.1 itself using
+# an Xbox Series controller.
+#
+# Only seed Port 1 when ALL normal gameplay controls are
+# unassigned. Any existing/user-customised mapping is left
+# completely untouched.
+# --------------------------------------------------------
+
+def seed_xbox_port(system_name, controller_type, mapping):
+    system = data.setdefault(system_name, {})
+    port = system.setdefault("Port1", {})
+    current = port.setdefault("Mapping1", {})
+
+    gameplay_keys = (
+        "A", "B",
+        "Up", "Down", "Left", "Right",
+        "Start", "Select",
+    )
+
+    if all((current.get(key, 0) or 0) == 0 for key in gameplay_keys):
+        port["Type"] = controller_type
+
+        for key, value in mapping.items():
+            current[key] = value
+
+
+seed_xbox_port(
+    "Nes",
+    "NesController",
+    {
+        "A": 4096,
+        "B": 4097,
+        "Up": 4125,
+        "Down": 4124,
+        "Left": 4123,
+        "Right": 4122,
+        "Start": 4107,
+        "Select": 4106,
+    },
+)
+
+seed_xbox_port(
+    "Sms",
+    "SmsController",
+    {
+        "A": 4097,
+        "B": 4096,
+        "Up": 4125,
+        "Down": 4124,
+        "Left": 4123,
+        "Right": 4122,
+        "Start": 4107,
+        "Select": 0,
+    },
+)
+
+config.write_text(
+    json.dumps(data, indent=2),
+    encoding="utf-8-sig"
+)
+PYMESEN
+
+    echo "BareFront MesenCE baseline created:"
+    echo "  $MESEN_CONFIG"
+    echo
+    echo "  First-run wizard: suppressed"
+    echo "  Automatic updates: OFF"
+    echo "  Esc: exit to BareFront"
+    echo "  Mesen screenshot hotkey: unassigned"
+    echo "  Save directory: $MESEN_SAVE_DIR"
+    echo "  Action: CREATE BASELINE"
+
+fi
+
+echo
+echo "Mesen stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Part 2: DuckStation
+# ============================================================
+
+heading "STAGE 3B / DUCKSTATION"
+
+DUCKSTATION_DIR="$BAREFRONT_DIR/emulators/duckstation"
+DUCKSTATION_EXE="$DUCKSTATION_DIR/DuckStation.AppImage"
+DUCKSTATION_SETTINGS="$DUCKSTATION_DIR/settings.ini"
+DUCKSTATION_GAMESCOPE="$BAREFRONT_DIR/runtime/presentation/gamescope/gamescope"
+DUCKSTATION_WRAPPER="$BAREFRONT_DIR/scripts/launch_duckstation.sh"
+DUCKSTATION_OVERLAY="$BAREFRONT_DIR/assets/overlays/ps1.png"
+
+# BareFront deliberately pins DuckStation to a known-good build.
+#
+# Do NOT change this to GitHub's moving "latest" tag.
+# Emulator updates must be tested before BareFront adopts them.
+DUCKSTATION_VERSION="v0.1-11752"
+DUCKSTATION_ASSET_NAME="DuckStation-x64.AppImage"
+DUCKSTATION_DOWNLOAD_URL="https://github.com/stenzek/duckstation/releases/download/$DUCKSTATION_VERSION/$DUCKSTATION_ASSET_NAME"
+DUCKSTATION_SHA256="169a7dd2c37731780eb3729cbe16f048fff3e3b6ef9c9f499869dc1174899a54"
+
+echo "BareFront uses DuckStation for:"
+echo "  PlayStation"
+echo
+echo "Pinned version:"
+echo "  $DUCKSTATION_VERSION"
+echo
+echo "Install location:"
+echo "  $DUCKSTATION_DIR"
+echo
+
+mkdir -p "$DUCKSTATION_DIR"
+
+# ------------------------------------------------------------
+# DuckStation Xbox Share exit helper
+# ------------------------------------------------------------
+
+DUCKSTATION_GUIDE_SOURCE="$BAREFRONT_DIR/src/duckstation_guide_exit_helper.cpp"
+DUCKSTATION_GUIDE_HELPER="$DUCKSTATION_DIR/duckstation_guide_exit_helper"
+
+if [[ ! -f "$DUCKSTATION_GUIDE_SOURCE" ]]; then
+    die "DuckStation Share helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "DuckStation Share helper build dependencies are missing."
+fi
+
+if [[ ! -x "$DUCKSTATION_GUIDE_HELPER" ]] ||
+   [[ "$DUCKSTATION_GUIDE_SOURCE" -nt "$DUCKSTATION_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building DuckStation Xbox Share helper..."
+
+    DUCKSTATION_GUIDE_CANDIDATE="$(
+        mktemp "$DUCKSTATION_DIR/.duckstation-guide-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra "$DUCKSTATION_GUIDE_SOURCE" -o "$DUCKSTATION_GUIDE_CANDIDATE" $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$DUCKSTATION_GUIDE_CANDIDATE"
+        die "DuckStation Share helper compilation failed."
+    fi
+
+    chmod 755 "$DUCKSTATION_GUIDE_CANDIDATE"
+    mv -fT "$DUCKSTATION_GUIDE_CANDIDATE" "$DUCKSTATION_GUIDE_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo
+    echo "DuckStation Share helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$DUCKSTATION_GUIDE_HELPER" ]]; then
+    die "DuckStation Share helper build failed."
+fi
+
+
+if [[ ! -x "$DUCKSTATION_GAMESCOPE" ]]; then
+    die "Gamescope executable not found: $DUCKSTATION_GAMESCOPE"
+fi
+
+if [[ ! -x "$DUCKSTATION_WRAPPER" ]]; then
+    die "DuckStation BareFront wrapper is missing or not executable."
+fi
+
+if [[ ! -s "$DUCKSTATION_OVERLAY" ]]; then
+    die "Tracked PlayStation overlay missing: $DUCKSTATION_OVERLAY"
+fi
+
+# ------------------------------------------------------------
+# Install / verify the pinned DuckStation build
+# ------------------------------------------------------------
+
+NEED_DUCKSTATION_INSTALL=1
+
+if [[ -f "$DUCKSTATION_EXE" ]]; then
+
+    ACTUAL_SHA256="$(sha256sum "$DUCKSTATION_EXE" | awk '{print $1}')"
+
+    if [[ "$ACTUAL_SHA256" == "$DUCKSTATION_SHA256" ]]; then
+
+        echo "DuckStation already matches BareFront's pinned build."
+        echo "  SHA-256: OK"
+
+        chmod +x "$DUCKSTATION_EXE"
+        NEED_DUCKSTATION_INSTALL=0
+
+    else
+
+        echo "Existing DuckStation does not match the pinned build."
+        echo "Existing SHA-256:"
+        echo "  $ACTUAL_SHA256"
+        echo "Expected SHA-256:"
+        echo "  $DUCKSTATION_SHA256"
+        echo
+
+        # BareFront may replace a binary which it previously installed,
+        # but must never silently overwrite an unmanaged/user-supplied one.
+        if [[ -f "$DUCKSTATION_DIR/VERSION.txt" ]] &&
+           grep -q '^BareFront managed emulator$' "$DUCKSTATION_DIR/VERSION.txt"
+        then
+            echo "Existing DuckStation is BareFront-managed."
+            echo "Action: replace with pinned build."
+        else
+            echo "WARNING: Existing DuckStation is not marked as BareFront-managed."
+            echo "BareFront will not overwrite it."
+            die "Remove or relocate the unmanaged DuckStation binary before continuing."
+        fi
+    fi
+fi
+
+
+if [[ "$NEED_DUCKSTATION_INSTALL" -eq 1 ]]; then
+
+    TEMP_DIR="$(mktemp -d)"
+    TEMP_DOWNLOAD="$TEMP_DIR/DuckStation.AppImage"
+
+    echo "Downloading DuckStation $DUCKSTATION_VERSION..."
+
+    if ! curl -fL --progress-bar \
+        "$DUCKSTATION_DOWNLOAD_URL" \
+        -o "$TEMP_DOWNLOAD"
+    then
+        rm -rf "$TEMP_DIR"
+        die "DuckStation download failed."
+    fi
+
+    echo
+    echo "Checking DuckStation SHA-256..."
+
+    ACTUAL_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+    if [[ "$ACTUAL_SHA256" != "$DUCKSTATION_SHA256" ]]; then
+        echo "Expected:"
+        echo "  $DUCKSTATION_SHA256"
+        echo "Received:"
+        echo "  $ACTUAL_SHA256"
+
+        rm -rf "$TEMP_DIR"
+        die "DuckStation SHA-256 verification failed."
+    fi
+
+    echo "  SHA-256: OK"
+
+    # Inspect the downloaded contents rather than trusting the filename.
+    DOWNLOAD_TYPE="$(file -b "$TEMP_DOWNLOAD")"
+
+    echo
+    echo "Downloaded file type:"
+    echo "  $DOWNLOAD_TYPE"
+
+    if ! grep -qiE 'ELF|AppImage|executable' <<< "$DOWNLOAD_TYPE"; then
+        rm -rf "$TEMP_DIR"
+        die "Downloaded DuckStation file does not look executable."
+    fi
+
+    DUCKSTATION_INSTALL_CANDIDATE="$(
+        mktemp "$DUCKSTATION_DIR/.DuckStation-install.XXXXXX"
+    )"
+
+    if ! install -m 0755 \
+        "$TEMP_DOWNLOAD" \
+        "$DUCKSTATION_INSTALL_CANDIDATE"
+    then
+        rm -f -- "$DUCKSTATION_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not stage the pinned DuckStation AppImage."
+    fi
+
+    CANDIDATE_SHA256="$(
+        sha256sum "$DUCKSTATION_INSTALL_CANDIDATE" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$CANDIDATE_SHA256" != "$DUCKSTATION_SHA256" ]]; then
+        rm -f -- "$DUCKSTATION_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Staged DuckStation AppImage failed SHA-256 verification."
+    fi
+
+    if ! mv -fT \
+        "$DUCKSTATION_INSTALL_CANDIDATE" \
+        "$DUCKSTATION_EXE"
+    then
+        rm -f -- "$DUCKSTATION_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not promote the pinned DuckStation AppImage."
+    fi
+
+    rm -rf "$TEMP_DIR"
+
+    echo
+    echo "DuckStation $DUCKSTATION_VERSION installed."
+fi
+
+
+# ------------------------------------------------------------
+# DuckStation portable user-data mode
+#
+# portable.txt makes DuckStation use this directory as its
+# data root rather than ~/.local/share/duckstation.
+# ------------------------------------------------------------
+
+touch "$DUCKSTATION_DIR/portable.txt"
+
+echo
+echo "DuckStation portable mode:"
+echo "  ENABLED"
+
+
+# ------------------------------------------------------------
+# BareFront PS1 save location
+#
+# DuckStation resolves relative folder settings from its data
+# root. In portable mode that is emulators/duckstation/.
+#
+# ../../saves/ps1 therefore resolves to:
+#
+#   BareFront/saves/ps1
+# ------------------------------------------------------------
+
+mkdir -p "$BAREFRONT_DIR/saves/ps1"
+
+
+# ------------------------------------------------------------
+# BareFront first-run DuckStation baseline
+#
+# IMPORTANT:
+# Create this file ONLY when no DuckStation settings already
+# exist. Once created, the settings belong to the user.
+#
+# Re-running the installer must never overwrite customised
+# emulator settings.
+# ------------------------------------------------------------
+
+if [[ -f "$DUCKSTATION_SETTINGS" ]]; then
+
+    echo
+    echo "DuckStation settings:"
+    echo "  Existing settings.ini preserved."
+
+else
+
+    cat > "$DUCKSTATION_SETTINGS" <<'EOF'
+[Main]
+SetupWizardIncomplete = false
+ConfirmPowerOff = false
+SaveStateOnExit = false
+NoDesktopFile = true
+
+[AutoUpdater]
+CheckAtStartup = false
+
+[MemoryCards]
+Directory = ../../saves/ps1
+
+[Folders]
+SaveStates = ../../saves/ps1
+
+[Hotkeys]
+OpenPauseMenu =
+PowerOff = Keyboard/Escape
+LoadSelectedSaveState = Keyboard/F1
+SaveSelectedSaveState = Keyboard/F2
+SelectPreviousSaveStateSlot = Keyboard/F3
+SelectNextSaveStateSlot = Keyboard/F4
+ChangeDisc = Keyboard/F5
+
+[Pad1]
+Circle = SDL-0/B
+Cross = SDL-0/A
+Down = SDL-0/DPadDown
+L1 = SDL-0/LeftShoulder
+L2 = SDL-0/+LeftTrigger
+L3 = SDL-0/LeftStick
+LDown = SDL-0/+LeftY
+LLeft = SDL-0/-LeftX
+LRight = SDL-0/+LeftX
+LUp = SDL-0/-LeftY
+LargeMotor = SDL-0/LargeMotor
+Left = SDL-0/DPadLeft
+R1 = SDL-0/RightShoulder
+R2 = SDL-0/+RightTrigger
+R3 = SDL-0/RightStick
+RDown = SDL-0/+RightY
+RLeft = SDL-0/-RightX
+RRight = SDL-0/+RightX
+RUp = SDL-0/-RightY
+Right = SDL-0/DPadRight
+Select = SDL-0/Back
+SmallMotor = SDL-0/SmallMotor
+Square = SDL-0/X
+Start = SDL-0/Start
+Triangle = SDL-0/Y
+Type = AnalogController
+Up = SDL-0/DPadUp
+
+
+[GPU]
+ResolutionScale = 1
+Multisamples = 1
+TextureFilter = Nearest
+SpriteTextureFilter = Nearest
+DownsampleMode = Disabled
+WidescreenHack = false
+ChromaSmoothing24Bit = false
+DitheringMode = Unscaled
+PGXPEnable = false
+
+[Display]
+Scaling = Nearest
+Scaling24Bit = Nearest
+AspectRatio = Auto
+CropMode = None
+EOF
+
+    echo
+    echo "DuckStation settings:"
+    echo "  BareFront first-run baseline created."
+fi
+
+
+# ------------------------------------------------------------
+# BareFront-owned DuckStation multidisc hotkey
+#
+# The controller helper maps LB+RB+Y to F5, so ChangeDisc must
+# remain bound to F5. This updates only that single integration
+# key and preserves every unrelated user-managed setting.
+# ------------------------------------------------------------
+
+python3 - "$DUCKSTATION_SETTINGS" <<'PYCONFIG_PS1_MULTIDISC'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+
+def set_value(section, key, value):
+    header = f"[{section}]"
+
+    try:
+        section_start = lines.index(header)
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+
+        lines.extend([
+            header,
+            f"{key} = {value}",
+            "",
+        ])
+        return
+
+    section_end = len(lines)
+
+    for i in range(section_start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            section_end = i
+            break
+
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].lstrip()
+
+        if (stripped.startswith(f"{key} =") or
+                stripped.startswith(f"{key}=")):
+            lines[i] = f"{key} = {value}"
+            return
+
+    lines.insert(section_end, f"{key} = {value}")
+
+set_value("Hotkeys", "ChangeDisc", "Keyboard/F5")
+
+path.write_text("\n".join(lines) + "\n")
+PYCONFIG_PS1_MULTIDISC
+
+echo "DuckStation BareFront multidisc hotkey:"
+echo "  ChangeDisc: Keyboard/F5"
+
+# ------------------------------------------------------------
+# BareFront default DuckStation controller mapping
+#
+# If the user already has a Pad1 section it belongs to them and
+# is preserved untouched. Otherwise install the controller map
+# validated with BareFront's Xbox Series X controller.
+#
+# Xbox Share is deliberately absent: Share belongs to BareFront.
+# ------------------------------------------------------------
+
+python3 - "$DUCKSTATION_SETTINGS" <<'PYCONFIG_PS1_PAD1'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+
+if "[Pad1]" not in lines:
+    if lines and lines[-1] != "":
+        lines.append("")
+
+    pad1 = ['[Pad1]', 'Circle = SDL-0/B', 'Cross = SDL-0/A', 'Down = SDL-0/DPadDown', 'L1 = SDL-0/LeftShoulder', 'L2 = SDL-0/+LeftTrigger', 'L3 = SDL-0/LeftStick', 'LDown = SDL-0/+LeftY', 'LLeft = SDL-0/-LeftX', 'LRight = SDL-0/+LeftX', 'LUp = SDL-0/-LeftY', 'LargeMotor = SDL-0/LargeMotor', 'Left = SDL-0/DPadLeft', 'R1 = SDL-0/RightShoulder', 'R2 = SDL-0/+RightTrigger', 'R3 = SDL-0/RightStick', 'RDown = SDL-0/+RightY', 'RLeft = SDL-0/-RightX', 'RRight = SDL-0/+RightX', 'RUp = SDL-0/-RightY', 'Right = SDL-0/DPadRight', 'Select = SDL-0/Back', 'SmallMotor = SDL-0/SmallMotor', 'Square = SDL-0/X', 'Start = SDL-0/Start', 'Triangle = SDL-0/Y', 'Type = AnalogController', 'Up = SDL-0/DPadUp', '']
+    lines.extend(pad1)
+    lines.append("")
+
+    path.write_text("\n".join(lines) + "\n")
+PYCONFIG_PS1_PAD1
+
+echo "DuckStation controller mapping:"
+echo "  Existing Pad1 preserved, or BareFront default installed."
+echo "  Xbox Share remains reserved for BareFront."
+
+# ------------------------------------------------------------
+# DuckStation BIOS
+#
+# DuckStation expects BIOS images inside <user directory>/bios.
+# BareFront's firmware location is bios/ps1/.
+#
+# A symbolic link lets both conventions refer to the same folder.
+# ------------------------------------------------------------
+
+DUCK_BIOS_LINK="$DUCKSTATION_DIR/bios"
+BAREFRONT_PS1_BIOS="$BAREFRONT_DIR/bios/ps1"
+
+if [[ -L "$DUCK_BIOS_LINK" ]]; then
+
+    CURRENT_TARGET="$(readlink "$DUCK_BIOS_LINK")"
+
+    if [[ "$CURRENT_TARGET" != "$BAREFRONT_PS1_BIOS" ]]; then
+        echo
+        echo "ERROR: Existing DuckStation BIOS symbolic link points to:"
+        echo "  $CURRENT_TARGET"
+        echo "Expected:"
+        echo "  $BAREFRONT_PS1_BIOS"
+        echo "BareFront will not overwrite it."
+        die "DuckStation BIOS must follow BareFront's active BIOS source."
+    fi
+
+elif [[ -e "$DUCK_BIOS_LINK" ]]; then
+
+    echo
+    echo "ERROR: DuckStation already has a real 'bios' directory."
+    echo "BareFront will not overwrite it."
+    echo "Expected BareFront BIOS source:"
+    echo "  $BAREFRONT_PS1_BIOS"
+    die "DuckStation BIOS must follow BareFront's active BIOS source."
+
+else
+
+    ln -s "$BAREFRONT_PS1_BIOS" "$DUCK_BIOS_LINK"
+
+    echo
+    echo "Created DuckStation BIOS link:"
+    echo "  $DUCK_BIOS_LINK"
+    echo "       -> $BAREFRONT_PS1_BIOS"
+fi
+
+
+# ------------------------------------------------------------
+# Record the BareFront-managed build
+# ------------------------------------------------------------
+
+if [[ ! -f "$DUCKSTATION_DIR/VERSION.txt" ]] ||
+   grep -q '^BareFront managed emulator$' "$DUCKSTATION_DIR/VERSION.txt"
+then
+
+    cat > "$DUCKSTATION_DIR/VERSION.txt" <<EOF
+BareFront managed emulator
+Emulator: DuckStation
+Version: $DUCKSTATION_VERSION
+Source: https://github.com/stenzek/duckstation
+Asset: $DUCKSTATION_ASSET_NAME
+SHA256: $DUCKSTATION_SHA256
+EOF
+
+else
+
+    echo
+    echo "WARNING: Existing DuckStation VERSION.txt is not BareFront-managed."
+    echo "Leaving it untouched."
+fi
+
+
+# ------------------------------------------------------------
+# Final DuckStation verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying DuckStation..."
+
+if [[ ! -x "$DUCKSTATION_EXE" ]]; then
+    die "DuckStation installation verification failed."
+fi
+
+ACTUAL_SHA256="$(sha256sum "$DUCKSTATION_EXE" | awk '{print $1}')"
+
+if [[ "$ACTUAL_SHA256" != "$DUCKSTATION_SHA256" ]]; then
+    die "Installed DuckStation does not match the pinned SHA-256."
+fi
+
+echo "  Executable: OK"
+echo "  Version:    $DUCKSTATION_VERSION"
+echo "  SHA-256:    OK"
+echo "  Gamescope:  OK"
+echo "  BareFront launcher: OK"
+echo "  Presentation overlay: OK"
+
+if [[ -f "$DUCKSTATION_DIR/portable.txt" ]]; then
+    echo "  Portable mode marker: OK"
+else
+    die "DuckStation portable mode marker is missing."
+fi
+
+if [[ -f "$DUCKSTATION_SETTINGS" ]]; then
+    echo "  settings.ini: OK"
+else
+    die "DuckStation settings.ini is missing."
+fi
+
+if [[ ! -L "$DUCK_BIOS_LINK" ]]; then
+    die "DuckStation BIOS link is missing."
+fi
+
+DUCK_FINAL_BIOS_TARGET="$(
+    readlink "$DUCK_BIOS_LINK"
+)"
+
+if [[ "$DUCK_FINAL_BIOS_TARGET" != "$BAREFRONT_PS1_BIOS" ]]; then
+    die "DuckStation BIOS link does not follow BareFront's active BIOS source."
+fi
+
+echo "  BIOS active-source link: OK"
+
+if [[ -d "$BAREFRONT_DIR/saves/ps1" ]]; then
+    echo "  PS1 save directory: OK"
+else
+    die "BareFront PS1 save directory is missing."
+fi
+
+echo
+echo "DuckStation stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Part 3: PCSX2
+# ============================================================
+
+heading "STAGE 3B / PCSX2"
+
+PCSX2_DIR="$BAREFRONT_DIR/emulators/pcsx2"
+PCSX2_EXE="$PCSX2_DIR/PCSX2.AppImage"
+PCSX2_LAUNCHER="$PCSX2_DIR/launch_pcsx2.sh"
+PCSX2_GAMESCOPE="$BAREFRONT_DIR/runtime/presentation/gamescope/gamescope"
+PCSX2_BARECRT="$BAREFRONT_DIR/assets/shaders/barecrt/BareCRT_v2.fx"
+PCSX2_OVERLAY="$BAREFRONT_DIR/assets/overlays/ps2.png"
+
+# BareFront deliberately pins PCSX2 to a known build.
+#
+# Do NOT change this to GitHub's moving "latest" release.
+# Emulator updates must be tested before BareFront adopts them.
+PCSX2_VERSION="v2.6.3"
+PCSX2_ASSET_NAME="pcsx2-v2.6.3-linux-appimage-x64-Qt.AppImage"
+PCSX2_DOWNLOAD_URL="https://github.com/PCSX2/pcsx2/releases/download/$PCSX2_VERSION/$PCSX2_ASSET_NAME"
+PCSX2_SHA256="8ce7de8613c17b00b01028a512dd1b81998b6626ebbe93a067e0eb20aeedd5bf"
+
+echo "BareFront uses PCSX2 for:"
+echo "  PlayStation 2"
+echo
+echo "Pinned version:"
+echo "  $PCSX2_VERSION"
+echo
+echo "Install location:"
+echo "  $PCSX2_DIR"
+echo
+
+mkdir -p "$PCSX2_DIR"
+
+# ------------------------------------------------------------
+# PCSX2 Xbox Share exit helper
+# ------------------------------------------------------------
+
+PCSX2_GUIDE_SOURCE="$BAREFRONT_DIR/src/pcsx2_guide_exit_helper.cpp"
+PCSX2_GUIDE_HELPER="$PCSX2_DIR/pcsx2_guide_exit_helper"
+
+if [[ ! -f "$PCSX2_GUIDE_SOURCE" ]]; then
+    die "PCSX2 Share helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "PCSX2 Share helper build dependencies are missing."
+fi
+
+if [[ ! -x "$PCSX2_GUIDE_HELPER" ]] ||
+   [[ "$PCSX2_GUIDE_SOURCE" -nt "$PCSX2_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building PCSX2 Xbox Share helper..."
+
+    PCSX2_GUIDE_TEMP="$(mktemp "$PCSX2_DIR/.pcsx2-guide.XXXXXX")"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$PCSX2_GUIDE_SOURCE" \
+        -o "$PCSX2_GUIDE_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$PCSX2_GUIDE_TEMP"
+        die "PCSX2 Share helper compilation failed."
+    fi
+
+    chmod 0755 "$PCSX2_GUIDE_TEMP"
+
+    if ! mv -fT -- "$PCSX2_GUIDE_TEMP" "$PCSX2_GUIDE_HELPER"; then
+        rm -f -- "$PCSX2_GUIDE_TEMP"
+        die "Could not promote the PCSX2 Share helper."
+    fi
+
+    echo "PCSX2 Xbox Share helper built."
+else
+    echo "PCSX2 Xbox Share helper already built."
+fi
+
+if [[ ! -f "$PCSX2_GUIDE_HELPER" ||
+      ! -x "$PCSX2_GUIDE_HELPER" ]]; then
+    die "PCSX2 Share helper verification failed."
+fi
+
+echo "  PCSX2 Share helper: OK"
+
+NEED_PCSX2_INSTALL=1
+
+if [[ -f "$PCSX2_EXE" ]]; then
+
+    ACTUAL_SHA256="$(sha256sum "$PCSX2_EXE" | awk '{print $1}')"
+
+    if [[ "$ACTUAL_SHA256" == "$PCSX2_SHA256" ]]; then
+
+        echo "PCSX2 already matches BareFront's pinned build."
+        echo "  SHA-256: OK"
+
+        chmod +x "$PCSX2_EXE"
+        NEED_PCSX2_INSTALL=0
+
+    else
+
+        echo "Existing PCSX2 does not match the pinned build."
+        echo "Existing SHA-256:"
+        echo "  $ACTUAL_SHA256"
+        echo "Expected SHA-256:"
+        echo "  $PCSX2_SHA256"
+        echo
+
+        # BareFront may replace a binary which it previously installed,
+        # but must never silently overwrite an unmanaged/user-supplied one.
+        if [[ -f "$PCSX2_DIR/VERSION.txt" ]] &&
+           grep -q '^BareFront managed emulator$' "$PCSX2_DIR/VERSION.txt"
+        then
+            echo "Existing PCSX2 is BareFront-managed."
+            echo "Action: replace with pinned build."
+        else
+            echo "WARNING: Existing PCSX2 is not marked as BareFront-managed."
+            echo "BareFront will not overwrite it."
+            die "Remove or relocate the unmanaged PCSX2 binary before continuing."
+        fi
+    fi
+fi
+
+
+if [[ "$NEED_PCSX2_INSTALL" -eq 1 ]]; then
+
+    TEMP_DIR="$(mktemp -d)"
+    TEMP_DOWNLOAD="$TEMP_DIR/PCSX2.AppImage"
+
+    echo "Downloading PCSX2 $PCSX2_VERSION..."
+
+    if ! curl -fL --progress-bar \
+        "$PCSX2_DOWNLOAD_URL" \
+        -o "$TEMP_DOWNLOAD"
+    then
+        rm -rf "$TEMP_DIR"
+        die "PCSX2 download failed."
+    fi
+
+    echo
+    echo "Checking PCSX2 SHA-256..."
+
+    ACTUAL_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+    if [[ "$ACTUAL_SHA256" != "$PCSX2_SHA256" ]]; then
+        echo "Expected:"
+        echo "  $PCSX2_SHA256"
+        echo "Received:"
+        echo "  $ACTUAL_SHA256"
+
+        rm -rf "$TEMP_DIR"
+        die "PCSX2 SHA-256 verification failed."
+    fi
+
+    echo "  SHA-256: OK"
+
+    DOWNLOAD_TYPE="$(file -b "$TEMP_DOWNLOAD")"
+
+    echo
+    echo "Downloaded file type:"
+    echo "  $DOWNLOAD_TYPE"
+
+    if ! grep -qiE 'ELF|AppImage|executable' <<< "$DOWNLOAD_TYPE"; then
+        rm -rf "$TEMP_DIR"
+        die "Downloaded PCSX2 file does not look executable."
+    fi
+
+    PCSX2_INSTALL_CANDIDATE="$(
+        mktemp "$PCSX2_DIR/.PCSX2-install.XXXXXX"
+    )"
+
+    if ! install -m 0755 "$TEMP_DOWNLOAD" "$PCSX2_INSTALL_CANDIDATE"; then
+        rm -f -- "$PCSX2_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not stage the pinned PCSX2 AppImage."
+    fi
+
+    PCSX2_CANDIDATE_SHA256="$(
+        sha256sum "$PCSX2_INSTALL_CANDIDATE" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$PCSX2_CANDIDATE_SHA256" != "$PCSX2_SHA256" ]]; then
+        rm -f -- "$PCSX2_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Staged PCSX2 AppImage failed SHA-256 verification."
+    fi
+
+    if ! mv -fT "$PCSX2_INSTALL_CANDIDATE" "$PCSX2_EXE"; then
+        rm -f -- "$PCSX2_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not promote the pinned PCSX2 AppImage."
+    fi
+
+    rm -rf "$TEMP_DIR"
+
+    echo
+    echo "PCSX2 $PCSX2_VERSION installed."
+fi
+
+
+# Record the BareFront-managed build.
+#
+# A missing VERSION.txt is safe to create when the installed
+# binary already matches the exact BareFront pin.
+if [[ ! -f "$PCSX2_DIR/VERSION.txt" ]] ||
+   grep -q '^BareFront managed emulator$' "$PCSX2_DIR/VERSION.txt"
+then
+
+    cat > "$PCSX2_DIR/VERSION.txt" <<EOF
+BareFront managed emulator
+Emulator: PCSX2
+Version: $PCSX2_VERSION
+Source: https://github.com/PCSX2/pcsx2
+Asset: $PCSX2_ASSET_NAME
+SHA256: $PCSX2_SHA256
+EOF
+
+else
+
+    echo
+    echo "WARNING: Existing PCSX2 VERSION.txt is not BareFront-managed."
+    echo "Leaving it untouched."
+fi
+
+
+# ------------------------------------------------------------
+# PCSX2 portable data root
+# ------------------------------------------------------------
+
+# With the Linux AppImage, PCSX2 -portable stores its data in a
+# sibling "PCSX2" directory beside the AppImage.
+#
+# BareFront therefore always launches PCSX2 with -portable and
+# manages this directory as PCSX2's portable data root.
+PCSX2_DATA_DIR="$PCSX2_DIR/PCSX2"
+PCSX2_INI="$PCSX2_DATA_DIR/inis/PCSX2.ini"
+
+mkdir -p "$PCSX2_DATA_DIR"
+
+echo
+echo "PCSX2 portable data root:"
+echo "  $PCSX2_DATA_DIR"
+
+
+# ------------------------------------------------------------
+# BareFront-owned PS2 BIOS and save folders
+# ------------------------------------------------------------
+
+mkdir -p \
+    "$BAREFRONT_DIR/bios/ps2" \
+    "$BAREFRONT_DIR/saves/ps2/memcards" \
+    "$BAREFRONT_DIR/saves/ps2/sstates"
+
+
+ensure_symlink()
+{
+    local target="$1"
+    local link_path="$2"
+    local description="$3"
+
+    if [[ -L "$link_path" ]]; then
+
+        local current_target
+        current_target="$(readlink "$link_path")"
+
+        if [[ "$current_target" == "$target" ]]; then
+            echo "  $description: OK"
+        else
+            echo
+            echo "WARNING: Existing symbolic link:"
+            echo "  $link_path"
+            echo "currently points to:"
+            echo "  $current_target"
+            echo "Expected:"
+            echo "  $target"
+            echo "Leaving it untouched."
+        fi
+
+    elif [[ -e "$link_path" ]]; then
+
+        echo
+        echo "WARNING: A real file/directory already exists at:"
+        echo "  $link_path"
+        echo "BareFront will not overwrite it."
+
+    else
+
+        ln -s "$target" "$link_path"
+
+        echo "  $description: linked"
+        echo "    $link_path"
+        echo "      -> $target"
+
+    fi
+}
+
+
+echo
+echo "Connecting PCSX2 portable data folders to BareFront..."
+
+ensure_symlink \
+    "$BAREFRONT_DIR/bios/ps2" \
+    "$PCSX2_DATA_DIR/bios" \
+    "BIOS"
+
+ensure_symlink \
+    "$BAREFRONT_DIR/saves/ps2/memcards" \
+    "$PCSX2_DATA_DIR/memcards" \
+    "Memory cards"
+
+ensure_symlink \
+    "$BAREFRONT_DIR/saves/ps2/sstates" \
+    "$PCSX2_DATA_DIR/sstates" \
+    "Save states"
+
+
+# ------------------------------------------------------------
+# First-run PCSX2 configuration
+# ------------------------------------------------------------
+
+# Do not manufacture PCSX2's full configuration ourselves.
+#
+# On a genuinely fresh profile, the pinned PCSX2 build creates
+# its own default configuration, including its normal controller
+# and hotkey mappings. BareFront then changes only the small
+# appliance-facing settings it deliberately owns.
+#
+# Existing profiles retain their user-managed settings.
+# BareFront-owned appliance/presentation values are normalised
+# idempotently below after the profile exists.
+if [[ ! -f "$PCSX2_INI" ]]; then
+
+    echo
+    echo "Creating initial PCSX2 portable configuration..."
+
+    PCSX2_CONFIG_ENV=()
+
+    # A remote SSH shell has no graphical-session variables,
+    # even when the same user has an active local desktop.
+    #
+    # PCSX2 still needs that desktop while generating its initial
+    # Qt configuration. Discover the user's primary local session
+    # without changing the environment used by the rest of the
+    # installer.
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+
+        PCSX2_SESSION_ID="$(
+            loginctl show-user "$(id -un)" --property=Display --value 2>/dev/null || true
+        )"
+
+        PCSX2_LOCAL_DISPLAY="$(
+            loginctl show-session "$PCSX2_SESSION_ID" --property=Display --value 2>/dev/null || true
+        )"
+
+        if [[ -z "$PCSX2_LOCAL_DISPLAY" ]]; then
+            die "PCSX2 initial configuration needs an active graphical desktop."
+        fi
+
+        PCSX2_CONFIG_ENV+=(
+            "DISPLAY=$PCSX2_LOCAL_DISPLAY"
+        )
+
+        if [[ -f "$HOME/.Xauthority" ]]; then
+            PCSX2_CONFIG_ENV+=(
+                "XAUTHORITY=$HOME/.Xauthority"
+            )
+        fi
+
+        echo "  Using local graphical session: $PCSX2_LOCAL_DISPLAY"
+
+    fi
+
+    if ! env "${PCSX2_CONFIG_ENV[@]}"         "$PCSX2_EXE" -portable -testconfig
+    then
+        die "PCSX2 failed to create its initial portable configuration."
+    fi
+
+    if [[ ! -f "$PCSX2_INI" ]]; then
+        die "PCSX2 did not create the expected portable PCSX2.ini."
+    fi
+
+    python3 - "$PCSX2_INI" <<'PYCONFIG'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+
+
+def set_value(section, key, value):
+    header = f"[{section}]"
+
+    try:
+        section_start = lines.index(header)
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append(header)
+        lines.append(f"{key} = {value}")
+        lines.append("")
+        return
+
+    section_end = len(lines)
+
+    for i in range(section_start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            section_end = i
+            break
+
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].lstrip()
+
+        if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
+            lines[i] = f"{key} = {value}"
+            return
+
+    lines.insert(section_end, f"{key} = {value}")
+
+
+# BareFront appliance behaviour.
+set_value("UI", "SetupWizardIncomplete", "false")
+set_value("UI", "ConfirmShutdown", "false")
+
+# BareFront pins the emulator build, so PCSX2 must not self-update.
+set_value("AutoUpdater", "CheckAtStartup", "false")
+
+# Escape must return directly to BareFront rather than opening
+# PCSX2's pause menu.
+set_value("Hotkeys", "OpenPauseMenu", "")
+set_value("Hotkeys", "ShutdownVM", "Keyboard/Escape")
+
+# Do not hard-code a user's BIOS filename. BareFront's PS2
+# launcher selects a region-matching BIOS immediately before
+# each game starts.
+set_value("Filenames", "BIOS", "")
+
+path.write_text("\n".join(lines) + "\n")
+PYCONFIG
+
+    echo "Initial PCSX2 configuration created."
+    echo "  Setup wizard: disabled"
+    echo "  Automatic updates: disabled"
+    echo "  Escape: return to BareFront"
+    echo "  BIOS selection: mixed-region launcher"
+
+else
+
+    echo
+    echo "Existing PCSX2 configuration found."
+    echo "Preserving user-managed PCSX2 settings:"
+    echo "  $PCSX2_INI"
+
+fi
+
+
+# ------------------------------------------------------------
+# BareFront-owned PCSX2 appliance / presentation settings
+# ------------------------------------------------------------
+#
+# These values are part of BareFront's PS2 contract rather than
+# user preference:
+#
+# - emulator renders at native 1x
+# - no emulator-side final smoothing / enhancement
+# - original 4:3/3:2 aspect behaviour retained
+# - PCSX2 handles deinterlacing automatically per title
+# - Escape exits directly to BareFront
+# - Gamescope owns final integer scaling
+#
+# Apply these on every installer run while leaving controller,
+# memory-card, game-fix and other user-managed settings untouched.
+
+python3 - "$PCSX2_INI" <<'PYCONFIG_OWNED'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+
+
+def set_value(section, key, value):
+    header = f"[{section}]"
+
+    try:
+        section_start = lines.index(header)
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+
+        lines.extend([
+            header,
+            f"{key} = {value}",
+            "",
+        ])
+        return
+
+    section_end = len(lines)
+
+    for i in range(section_start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            section_end = i
+            break
+
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].lstrip()
+
+        if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
+            lines[i] = f"{key} = {value}"
+            return
+
+    lines.insert(section_end, f"{key} = {value}")
+
+
+# BareFront appliance behaviour.
+set_value("UI", "SetupWizardIncomplete", "false")
+set_value("UI", "ConfirmShutdown", "false")
+
+set_value("AutoUpdater", "CheckAtStartup", "false")
+
+set_value("Hotkeys", "OpenPauseMenu", "")
+set_value("Hotkeys", "ShutdownVM", "Keyboard/Escape")
+
+# The launcher chooses the matching BIOS immediately before launch.
+set_value("Filenames", "BIOS", "")
+
+# Neutral emulator-side presentation.
+set_value("EmuCore", "EnableWideScreenPatches", "false")
+set_value("EmuCore", "EnableNoInterlacingPatches", "false")
+
+set_value("EmuCore/GS", "AspectRatio", "Auto 4:3/3:2")
+set_value("EmuCore/GS", "IntegerScaling", "false")
+set_value("EmuCore/GS", "fxaa", "false")
+set_value("EmuCore/GS", "linear_present_mode", "0")
+set_value("EmuCore/GS", "deinterlace_mode", "0")
+set_value("EmuCore/GS", "upscale_multiplier", "1")
+set_value("EmuCore/GS", "TVShader", "0")
+
+# BAREFRONT_PCSX2_PAD1_MIGRATION
+#
+# PCSX2's fresh portable profile currently creates Pad1 with keyboard
+# bindings only. BareFront is controller-first, so migrate that exact
+# stock keyboard mapping to the Xbox/SDL layout.
+#
+# A profile which differs from the stock keyboard mapping is treated as
+# user-managed and is deliberately left untouched.
+keyboard_pad1 = {
+    "Up": "Keyboard/Up",
+    "Right": "Keyboard/Right",
+    "Down": "Keyboard/Down",
+    "Left": "Keyboard/Left",
+    "Triangle": "Keyboard/I",
+    "Circle": "Keyboard/L",
+    "Cross": "Keyboard/K",
+    "Square": "Keyboard/J",
+    "Select": "Keyboard/Backspace",
+    "Start": "Keyboard/Return",
+    "L1": "Keyboard/Q",
+    "L2": "Keyboard/1",
+    "R1": "Keyboard/E",
+    "R2": "Keyboard/3",
+    "L3": "Keyboard/2",
+    "R3": "Keyboard/4",
+    "LUp": "Keyboard/W",
+    "LRight": "Keyboard/D",
+    "LDown": "Keyboard/S",
+    "LLeft": "Keyboard/A",
+    "RUp": "Keyboard/T",
+    "RRight": "Keyboard/H",
+    "RDown": "Keyboard/G",
+    "RLeft": "Keyboard/F",
+}
+
+xbox_pad1 = {
+    "Up": "SDL-0/DPadUp",
+    "Right": "SDL-0/DPadRight",
+    "Down": "SDL-0/DPadDown",
+    "Left": "SDL-0/DPadLeft",
+    "Triangle": "SDL-0/FaceNorth",
+    "Circle": "SDL-0/FaceEast",
+    "Cross": "SDL-0/FaceSouth",
+    "Square": "SDL-0/FaceWest",
+    "Select": "SDL-0/Back",
+    "Start": "SDL-0/Start",
+    "L1": "SDL-0/LeftShoulder",
+    "L2": "SDL-0/+LeftTrigger",
+    "R1": "SDL-0/RightShoulder",
+    "R2": "SDL-0/+RightTrigger",
+    "L3": "SDL-0/LeftStick",
+    "R3": "SDL-0/RightStick",
+    "LUp": "SDL-0/-LeftY",
+    "LRight": "SDL-0/+LeftX",
+    "LDown": "SDL-0/+LeftY",
+    "LLeft": "SDL-0/-LeftX",
+    "RUp": "SDL-0/-RightY",
+    "RRight": "SDL-0/+RightX",
+    "RDown": "SDL-0/+RightY",
+    "RLeft": "SDL-0/-RightX",
+}
+
+try:
+    pad_start = lines.index("[Pad1]")
+except ValueError:
+    pad_start = None
+
+if pad_start is not None:
+    pad_end = len(lines)
+
+    for i in range(pad_start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            pad_end = i
+            break
+
+    values = {}
+    positions = {}
+
+    for i in range(pad_start + 1, pad_end):
+        if "=" not in lines[i]:
+            continue
+
+        key, value = lines[i].split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        values[key] = value
+        positions[key] = i
+
+    expected_stock_pad1 = {
+        "Type": "DualShock2",
+        "InvertL": "0",
+        "InvertR": "0",
+        "Deadzone": "0",
+        "AxisScale": "1.33",
+        "LargeMotorScale": "1",
+        "SmallMotorScale": "1",
+        "ButtonDeadzone": "0",
+        "PressureModifier": "0.5",
+        **keyboard_pad1,
+    }
+
+    stock_keyboard = values == expected_stock_pad1
+
+    if stock_keyboard:
+        for key, value in xbox_pad1.items():
+            lines[positions[key]] = f"{key} = {value}"
+
+        lines.insert(pad_end, "LargeMotor = SDL-0/LargeMotor")
+        lines.insert(pad_end + 1, "SmallMotor = SDL-0/SmallMotor")
+
+        print("  PCSX2 Pad1: stock keyboard mapping -> Xbox SDL mapping")
+    else:
+        print("  PCSX2 Pad1: existing user mapping preserved")
+
+path.write_text("\n".join(lines) + "\n")
+PYCONFIG_OWNED
+
+echo
+echo "BareFront PCSX2 presentation settings:"
+echo "  Internal resolution: 1x"
+echo "  Aspect:              Auto 4:3/3:2"
+echo "  Bilinear present:    disabled"
+echo "  Deinterlace:         automatic"
+echo "  Emulator FXAA:       disabled"
+echo "  Emulator TV shader:  disabled"
+echo "  Escape:              return to BareFront"
+
+
+# ------------------------------------------------------------
+# BareFront mixed-region PS2 launcher
+# ------------------------------------------------------------
+
+# BareFront owns this launcher. It determines the game's
+# region from the curated ROM filename, identifies real PS2
+# BIOS images from their ROMVER data, selects the newest
+# matching BIOS, then starts PCSX2 with an authentic slow boot.
+cat > "$PCSX2_LAUNCHER" <<'BAREFRONT_PCSX2_LAUNCHER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BAREFRONT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+PCSX2_EXE="$SCRIPT_DIR/PCSX2.AppImage"
+GUIDE_EXIT_HELPER="$SCRIPT_DIR/pcsx2_guide_exit_helper"
+PCSX2_DATA_DIR="$SCRIPT_DIR/PCSX2"
+PCSX2_INI="$PCSX2_DATA_DIR/inis/PCSX2.ini"
+BIOS_DIR="$PCSX2_DATA_DIR/bios"
+
+source "$BAREFRONT_DIR/scripts/barefront_presentation_runtime.sh"
+barefront_resolve_presentation_runtime "$BAREFRONT_DIR"
+
+GAMESCOPE="$BAREFRONT_GAMESCOPE"
+export VK_IMPLICIT_LAYER_PATH="$BAREFRONT_VKBASALT_LAYER_DIR"
+
+NATIVE_WIDTH=640
+NATIVE_HEIGHT=480
+INTEGER_SCALE=2
+
+OUTPUT_WIDTH=$((NATIVE_WIDTH * INTEGER_SCALE))
+OUTPUT_HEIGHT=$((NATIVE_HEIGHT * INTEGER_SCALE))
+
+VKBASALT_CONFIG="/tmp/barefront-vkbasalt-ps2.conf"
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+    MODE="--dry-run"
+    ROM="${2:-}"
+else
+    MODE="launch"
+    ROM="${1:-}"
+fi
+
+if [[ -z "$ROM" ]]; then
+    echo "ERROR: No PS2 game supplied." >&2
+    exit 1
+fi
+
+if [[ ! -f "$ROM" ]]; then
+    echo "ERROR: PS2 game not found:" >&2
+    echo "  $ROM" >&2
+    exit 1
+fi
+
+if [[ ! -x "$PCSX2_EXE" ]]; then
+    echo "ERROR: PCSX2 executable not found:" >&2
+    echo "  $PCSX2_EXE" >&2
+    exit 1
+fi
+
+if [[ ! -x "$GUIDE_EXIT_HELPER" ]]; then
+    echo "ERROR: PCSX2 Share helper missing: $GUIDE_EXIT_HELPER" >&2
+    exit 1
+fi
+
+if [[ ! -x "$GAMESCOPE" ]]; then
+    echo "ERROR: Gamescope executable not found:" >&2
+    echo "  $GAMESCOPE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$PCSX2_INI" ]]; then
+    echo "ERROR: PCSX2 portable configuration not found:" >&2
+    echo "  $PCSX2_INI" >&2
+    exit 1
+fi
+
+
+PREFERENCES="${BAREFRONT_SHADER_PREFS:-$BAREFRONT_DIR/saves/presentation/shaders.ini}"
+
+SHADER="NONE"
+
+if [[ -f "$PREFERENCES" ]]; then
+    while IFS='=' read -r section value; do
+        if [[ "$section" == "ps2" ]]; then
+            SHADER="${value%$'\r'}"
+        fi
+    done < "$PREFERENCES"
+fi
+
+EFFECT=""
+SHADER_FILE=""
+INCLUDE_DIR=""
+SETTINGS=""
+
+case "$SHADER" in
+    NONE)
+        ;;
+
+    BARECRT)
+        EFFECT="barecrt"
+        INCLUDE_DIR="$BAREFRONT_DIR/assets/shaders/barecrt"
+        SHADER_FILE="$INCLUDE_DIR/BareCRT_v2.fx"
+        SETTINGS="BareFrontScale = 2.0"
+        ;;
+
+    CRT-LITE)
+        EFFECT="CRT_Lite"
+        INCLUDE_DIR="$BAREFRONT_DIR/assets/shaders/crt-lite"
+        SHADER_FILE="$INCLUDE_DIR/CRT_Lite.fx"
+        SETTINGS="SCANLINE_COUNT = 0.0"
+        ;;
+
+    CRT-LOTTES)
+        EFFECT="CRT_Lottes"
+        INCLUDE_DIR="$BAREFRONT_DIR/assets/shaders/crt-lottes"
+        SHADER_FILE="$INCLUDE_DIR/CRT_Lottes.fx"
+        SETTINGS="$(printf 'fDownscale = 2.0\nfBlur = 2.6')"
+        ;;
+
+    *)
+        echo "STOP: Invalid PS2 shader preference: $SHADER" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$SHADER" != "NONE" ]]; then
+    for required in "$SHADER_FILE" "$INCLUDE_DIR/ReShade.fxh"; do
+        if [[ ! -f "$required" ]]; then
+            echo "STOP: Missing shader dependency: $required" >&2
+            exit 1
+        fi
+    done
+
+    if [[ "$SHADER" == "CRT-LOTTES" &&
+          ! -f "$INCLUDE_DIR/CRT_Lottes.fxh" ]]; then
+        echo "STOP: CRT_Lottes.fxh is missing." >&2
+        exit 1
+    fi
+fi
+
+echo "Shader: $SHADER"
+
+if [[ "$MODE" == "--dry-run" ]]; then
+    echo "PASS: Dry run only — BIOS selection not executed."
+    exit 0
+fi
+
+python3 - "$ROM" "$BIOS_DIR" "$PCSX2_INI" <<'PY'
+from pathlib import Path
+import re
+import struct
+import sys
+
+rom = Path(sys.argv[1])
+bios_dir = Path(sys.argv[2])
+ini = Path(sys.argv[3])
+
+REGION_CODES = {
+    "A": "USA",
+    "E": "Europe",
+    "J": "Japan",
+    "H": "Asia",
+    "C": "China",
+    "P": "Free",
+    "X": "Test",
+}
+
+
+def game_region(name):
+    rules = [
+        (r"\((?:USA|United States|Canada)\)|NTSC[- _]?U", "USA"),
+        (r"\((?:Europe|PAL|Australia|New Zealand)\)|\bPAL\b", "Europe"),
+        (r"\((?:Japan)\)|NTSC[- _]?J", "Japan"),
+        (r"\((?:Asia)\)", "Asia"),
+        (r"\((?:China)\)", "China"),
+    ]
+
+    matches = {
+        region
+        for pattern, region in rules
+        if re.search(pattern, name, re.IGNORECASE)
+    }
+
+    if len(matches) == 1:
+        return next(iter(matches))
+
+    if not matches:
+        raise SystemExit(
+            f"ERROR: Cannot determine PS2 game region from filename:\n  {name}"
+        )
+
+    raise SystemExit(
+        f"ERROR: Ambiguous PS2 game region in filename:\n"
+        f"  {name}\n"
+        f"Matches: {', '.join(sorted(matches))}"
+    )
+
+
+def identify_bios(path):
+    size = path.stat().st_size
+
+    if not (4 * 1024 * 1024 <= size <= 8 * 1024 * 1024):
+        return None
+
+    data = path.read_bytes()
+
+    romdir_pos = None
+
+    for pos in range(0, min(len(data), 512 * 1024), 16):
+        entry = data[pos:pos + 16]
+
+        if len(entry) < 16:
+            break
+
+        if entry[:10].split(b"\0", 1)[0] == b"RESET":
+            romdir_pos = pos
+            break
+
+    if romdir_pos is None:
+        return None
+
+    file_offset = 0
+    pos = romdir_pos
+
+    while pos + 16 <= len(data):
+        entry = data[pos:pos + 16]
+
+        name = (
+            entry[:10]
+            .split(b"\0", 1)[0]
+            .decode("ascii", "ignore")
+        )
+
+        if not name:
+            break
+
+        _, file_size = struct.unpack_from("<HI", entry, 10)
+
+        if name == "ROMVER":
+            romver = data[file_offset:file_offset + 14].decode(
+                "ascii", "replace"
+            )
+
+            if len(romver) != 14:
+                return None
+
+            region = REGION_CODES.get(romver[4])
+
+            if region is None:
+                return None
+
+            return {
+                "region": region,
+                "version": int(romver[0:4]),
+                "date": int(romver[6:14]),
+                "romver": romver,
+            }
+
+        file_offset += (file_size + 0x0F) & ~0x0F
+        pos += 16
+
+    return None
+
+
+region = game_region(rom.name)
+
+candidates = []
+
+for path in bios_dir.iterdir():
+    if not path.is_file():
+        continue
+
+    info = identify_bios(path)
+
+    if info and info["region"] == region:
+        candidates.append(
+            (info["date"], info["version"], path.name.lower(), path, info)
+        )
+
+if not candidates:
+    raise SystemExit(
+        f"ERROR: No valid {region} PS2 BIOS found in:\n  {bios_dir}"
+    )
+
+# Newest BIOS date first, then highest version.
+candidates.sort(reverse=True)
+
+_, _, _, selected, info = candidates[0]
+
+print(f"BareFront PS2 region: {region}")
+print(f"BareFront PS2 BIOS:   {selected.name}")
+
+lines = ini.read_text().splitlines()
+
+header = "[Filenames]"
+
+try:
+    start = lines.index(header)
+except ValueError:
+    if lines and lines[-1] != "":
+        lines.append("")
+
+    lines.extend([
+        header,
+        f"BIOS = {selected.name}",
+        "",
+    ])
+else:
+    end = len(lines)
+
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            end = i
+            break
+
+    for i in range(start + 1, end):
+        if lines[i].lstrip().startswith("BIOS ="):
+            lines[i] = f"BIOS = {selected.name}"
+            break
+    else:
+        lines.insert(end, f"BIOS = {selected.name}")
+
+ini.write_text("\n".join(lines) + "\n")
+PY
+
+
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+if [[ "$SHADER" == "NONE" ]]; then
+    LAUNCH_ENV=(env -u VKBASALT_CONFIG_FILE ENABLE_VKBASALT=0)
+else
+    cat > "$VKBASALT_CONFIG" <<EOF
+effects = $EFFECT
+$EFFECT = $SHADER_FILE
+reshadeIncludePath = $INCLUDE_DIR
+reshadeTexturePath = $INCLUDE_DIR
+enableOnLaunch = True
+$SETTINGS
+EOF
+
+    LAUNCH_ENV=(
+        env
+        ENABLE_VKBASALT=1
+        VKBASALT_CONFIG_FILE="$VKBASALT_CONFIG"
+    )
+fi
+
+echo "Starting PlayStation 2 through per-game Gamescope..."
+echo "  Canvas:      ${NATIVE_WIDTH}x${NATIVE_HEIGHT}"
+echo "  Integer:     ${INTEGER_SCALE}x"
+echo "  Output:      ${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}"
+echo "  Filter:      nearest"
+echo "  Shader:      $SHADER"
+
+exec "${LAUNCH_ENV[@]}" \
+    "$GAMESCOPE" \
+        -b \
+        -g \
+        -w "$NATIVE_WIDTH" \
+        -h "$NATIVE_HEIGHT" \
+        -W "$OUTPUT_WIDTH" \
+        -H "$OUTPUT_HEIGHT" \
+        -S integer \
+        -F nearest \
+        -- \
+        /bin/bash -c '
+            guide="$1"
+            shift
+
+            BAREFRONT_PS2_GUIDE_SESSION=1 "$guide" &
+            guide_pid=$!
+
+            "$@" &
+            game_pid=$!
+
+            cleanup() {
+                kill -TERM "$guide_pid" 2>/dev/null || true
+                wait "$guide_pid" 2>/dev/null || true
+            }
+
+            trap cleanup EXIT
+
+            if wait "$game_pid"; then
+                status=0
+            else
+                status=$?
+            fi
+
+            exit "$status"
+        ' _ \
+        "$GUIDE_EXIT_HELPER" \
+        "$PCSX2_EXE" \
+            -portable \
+            -batch \
+            -bigpicture \
+            -slowboot \
+            -fullscreen \
+            "$ROM"
+BAREFRONT_PCSX2_LAUNCHER_EOF
+
+chmod +x "$PCSX2_LAUNCHER"
+
+echo
+echo "Mixed-region PS2 launcher installed:"
+echo "  $PCSX2_LAUNCHER"
+
+
+# ------------------------------------------------------------
+# Final PCSX2 verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying PCSX2..."
+
+if [[ -x "$PCSX2_EXE" ]]; then
+    echo "  Executable: OK"
+    echo "  $PCSX2_EXE"
+else
+    die "PCSX2 installation verification failed."
+fi
+
+PCSX2_FINAL_SHA256="$(
+    sha256sum "$PCSX2_EXE" |
+        awk '{print $1}'
+)"
+
+if [[ "$PCSX2_FINAL_SHA256" != "$PCSX2_SHA256" ]]; then
+    die "Installed PCSX2 does not match the pinned SHA-256."
+fi
+
+echo "  Executable SHA-256: OK"
+
+if [[ -x "$PCSX2_LAUNCHER" ]]; then
+    echo "  Mixed-region launcher: OK"
+    echo "  $PCSX2_LAUNCHER"
+else
+    die "PCSX2 mixed-region launcher verification failed."
+fi
+
+if ! bash -n "$PCSX2_LAUNCHER"; then
+    die "PCSX2 launcher shell syntax verification failed."
+fi
+
+echo "  Launcher syntax: OK"
+
+if [[ -x "$PCSX2_GAMESCOPE" ]]; then
+    echo "  Gamescope: OK"
+else
+    die "PCSX2 presentation requires Gamescope."
+fi
+
+if [[ -f "$PCSX2_BARECRT" ]]; then
+    echo "  BareCRT: OK"
+else
+    die "PCSX2 presentation requires the shared BareCRT shader."
+fi
+
+if [[ -f "$PCSX2_OVERLAY" ]]; then
+    echo "  PS2 overlay: OK"
+else
+    die "PCSX2 presentation overlay is missing."
+fi
+
+if [[ -d "$PCSX2_DATA_DIR" ]]; then
+    echo "  Portable data root: OK"
+else
+    die "PCSX2 portable data root is missing."
+fi
+
+if [[ "$(readlink "$PCSX2_DATA_DIR/bios" 2>/dev/null || true)" == "$BAREFRONT_DIR/bios/ps2" ]]; then
+    echo "  BIOS link: OK"
+else
+    die "PCSX2 BIOS link verification failed."
+fi
+
+if [[ "$(readlink "$PCSX2_DATA_DIR/memcards" 2>/dev/null || true)" == "$BAREFRONT_DIR/saves/ps2/memcards" ]]; then
+    echo "  Memory-card link: OK"
+else
+    die "PCSX2 memory-card link verification failed."
+fi
+
+if [[ "$(readlink "$PCSX2_DATA_DIR/sstates" 2>/dev/null || true)" == "$BAREFRONT_DIR/saves/ps2/sstates" ]]; then
+    echo "  Save-state link: OK"
+else
+    die "PCSX2 save-state link verification failed."
+fi
+
+if [[ -f "$PCSX2_INI" ]]; then
+    echo "  Portable configuration: OK"
+else
+    die "PCSX2 portable configuration is missing."
+fi
+
+echo
+echo "BareFront PS2 launch path:"
+echo "  $PCSX2_LAUNCHER {rom}"
+echo
+echo "The launcher:"
+echo "  - detects the game's region from its curated filename"
+echo "  - identifies installed PS2 BIOS images from ROMVER data"
+echo "  - selects a matching BIOS for each game"
+echo "  - starts PCSX2 with -portable -batch -slowboot -fullscreen"
+echo "  - presents a 640x480 canvas through Gamescope"
+echo "  - scales 2x nearest to 1280x960"
+echo "  - applies the shared external BareCRT shader"
+echo
+echo "BareFront's 1920x1080 PS2 overlay provides the black surround"
+echo "around the centred 1280x960 gameplay aperture."
+echo
+echo "This preserves the authentic PS2 BIOS/startup sequence"
+echo "while supporting mixed-region curated libraries."
+echo
+echo "PCSX2 still requires BIOS images dumped from legitimately"
+echo "owned PlayStation 2 consoles. BareFront supplies no BIOS."
+echo
+echo "PCSX2 stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Part 4: Flycast
+# ============================================================
+
+heading "STAGE 3B / FLYCAST"
+
+FLYCAST_DIR="$BAREFRONT_DIR/emulators/flycast"
+FLYCAST_EXE="$FLYCAST_DIR/Flycast.AppImage"
+FLYCAST_LAUNCHER="$FLYCAST_DIR/launch_flycast.sh"
+FLYCAST_DATA_DIR="$FLYCAST_DIR/data"
+FLYCAST_GAMESCOPE="$BAREFRONT_GAMESCOPE"
+FLYCAST_OVERLAY="$BAREFRONT_DIR/assets/overlays/dreamcast.png"
+
+# BareFront Stage 8 known-good Flycast build.
+FLYCAST_EXPECTED_VERSION="v2.7"
+FLYCAST_EXPECTED_ASSET="flycast-x86_64-2.7.AppImage"
+FLYCAST_EXPECTED_SHA256="5b9f8a636a6acb8446bc78fe96650d8cb8233ac9f8ce69665dab3f39a1cbaae1"
+FLYCAST_API="https://api.github.com/repos/flyinghead/flycast/releases/tags/$FLYCAST_EXPECTED_VERSION"
+
+echo "BareFront uses Flycast for:"
+echo "  Dreamcast"
+echo
+echo "Install location:"
+echo "  $FLYCAST_DIR"
+echo
+
+mkdir -p \
+    "$FLYCAST_DIR" \
+    "$FLYCAST_DATA_DIR" \
+    "$BAREFRONT_DIR/bios/dreamcast" \
+    "$BAREFRONT_DIR/saves/dreamcast"
+
+
+FLYCAST_INSTALLED_SHA256=""
+
+if [[ -f "$FLYCAST_EXE" ]]; then
+    FLYCAST_INSTALLED_SHA256="$(
+        sha256sum "$FLYCAST_EXE" | awk '{print $1}'
+    )"
+fi
+
+
+if [[ -f "$FLYCAST_EXE" \
+   && "$FLYCAST_INSTALLED_SHA256" == "$FLYCAST_EXPECTED_SHA256" ]]
+then
+
+    echo "Flycast pinned build is already installed."
+    echo "Executable:"
+    echo "  $FLYCAST_EXE"
+    echo "  SHA-256: OK"
+
+    chmod +x "$FLYCAST_EXE"
+
+    echo "Action: SKIP"
+
+else
+
+    if [[ -e "$FLYCAST_EXE" ]]; then
+
+        if [[ ! -f "$FLYCAST_EXE" ]]; then
+            die "Existing Flycast path is not a regular file."
+        fi
+
+        echo "Existing Flycast build does not match the BareFront pin."
+
+        if [[ -f "$FLYCAST_DIR/VERSION.txt" ]] &&
+           grep -q '^BareFront managed emulator$' "$FLYCAST_DIR/VERSION.txt"
+        then
+            echo "Existing Flycast is BareFront-managed."
+            echo "Action: REPLACE"
+            echo
+        else
+            echo "WARNING: Existing Flycast is not marked as BareFront-managed."
+            echo "BareFront will not overwrite it."
+            die "Remove or relocate the unmanaged Flycast binary before continuing."
+        fi
+    fi
+
+    echo "Asking GitHub for the pinned Flycast release..."
+    echo
+
+    # /releases/latest returns the newest normal tagged release,
+    # not nightly/master development builds.
+    if ! FLYCAST_RELEASE_JSON="$(curl -fsSL "$FLYCAST_API")"; then
+        die "Could not retrieve Flycast stable release information."
+    fi
+
+    FLYCAST_VERSION="$(
+        printf '%s' "$FLYCAST_RELEASE_JSON" \
+        | jq -r '.tag_name // empty'
+    )"
+
+    if [[ -z "$FLYCAST_VERSION" ]]; then
+        die "GitHub did not return a Flycast stable release version."
+    fi
+
+    if [[ "$FLYCAST_VERSION" != "$FLYCAST_EXPECTED_VERSION" ]]; then
+        die "Flycast release mismatch: expected $FLYCAST_EXPECTED_VERSION, got $FLYCAST_VERSION."
+    fi
+
+    echo "Latest stable release:"
+    echo "  $FLYCAST_VERSION"
+    echo
+
+    # Pick the official Linux x86-64 AppImage.
+    #
+    # Asset names have changed slightly between releases, so we
+    # select by characteristics rather than hard-coding the exact
+    # filename forever.
+    FLYCAST_ASSET_JSON="$(
+        printf '%s' "$FLYCAST_RELEASE_JSON" \
+        | jq -c '
+            [
+              .assets[]
+              | select(.name | test("appimage"; "i"))
+              | select(.name | test("x86_64|x64"; "i"))
+              | select((.name | test("arm|aarch64"; "i")) | not)
+            ][0] // empty
+          '
+    )"
+
+    if [[ -z "$FLYCAST_ASSET_JSON" ]]; then
+        echo "Release assets returned by GitHub:"
+        printf '%s' "$FLYCAST_RELEASE_JSON" \
+            | jq -r '.assets[]?.name' \
+            | sed 's/^/  /'
+        die "Could not identify the official Flycast Linux x86-64 AppImage."
+    fi
+
+    FLYCAST_ASSET_NAME="$(
+        printf '%s' "$FLYCAST_ASSET_JSON" \
+        | jq -r '.name'
+    )"
+
+    FLYCAST_DOWNLOAD_URL="$(
+        printf '%s' "$FLYCAST_ASSET_JSON" \
+        | jq -r '.browser_download_url'
+    )"
+
+    if [[ "$FLYCAST_ASSET_NAME" != "$FLYCAST_EXPECTED_ASSET" ]]; then
+        die "Flycast asset mismatch: expected $FLYCAST_EXPECTED_ASSET, got $FLYCAST_ASSET_NAME."
+    fi
+
+    FLYCAST_DIGEST="$(
+        printf '%s' "$FLYCAST_ASSET_JSON" \
+        | jq -r '.digest // empty'
+    )"
+
+    echo "Selected asset:"
+    echo "  $FLYCAST_ASSET_NAME"
+    echo
+
+    TEMP_DIR="$(mktemp -d)"
+    TEMP_DOWNLOAD="$TEMP_DIR/Flycast.AppImage"
+
+    echo "Downloading official stable AppImage..."
+
+    if ! curl -fL --progress-bar \
+        "$FLYCAST_DOWNLOAD_URL" \
+        -o "$TEMP_DOWNLOAD"
+    then
+        rm -rf "$TEMP_DIR"
+        die "Flycast download failed."
+    fi
+
+    PINNED_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+    echo
+    echo "Checking pinned Flycast SHA-256..."
+
+    if [[ "$PINNED_SHA256" != "$FLYCAST_EXPECTED_SHA256" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "Flycast pinned SHA-256 verification failed."
+    fi
+
+    echo "  SHA-256: OK"
+
+    if [[ "$FLYCAST_DIGEST" == sha256:* ]]; then
+
+        EXPECTED_SHA256="${FLYCAST_DIGEST#sha256:}"
+        ACTUAL_SHA256="$(sha256sum "$TEMP_DOWNLOAD" | awk '{print $1}')"
+
+        echo
+        echo "Checking Flycast SHA-256..."
+
+        if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+            rm -rf "$TEMP_DIR"
+            die "Flycast SHA-256 verification failed."
+        fi
+
+        echo "  SHA-256: OK"
+
+    else
+
+        echo
+        echo "No release-asset SHA-256 was supplied by GitHub."
+        echo "The AppImage was downloaded directly from the official"
+        echo "Flycast GitHub release."
+
+    fi
+
+    DOWNLOAD_TYPE="$(file -b "$TEMP_DOWNLOAD")"
+
+    echo
+    echo "Downloaded file type:"
+    echo "  $DOWNLOAD_TYPE"
+
+    if ! grep -qiE 'ELF|AppImage|executable' <<< "$DOWNLOAD_TYPE"; then
+        rm -rf "$TEMP_DIR"
+        die "Downloaded Flycast file does not look executable."
+    fi
+
+    FLYCAST_INSTALL_CANDIDATE="$(
+        mktemp "$FLYCAST_DIR/.Flycast-install.XXXXXX"
+    )"
+
+    if ! install -m 0755 "$TEMP_DOWNLOAD" "$FLYCAST_INSTALL_CANDIDATE"; then
+        rm -f -- "$FLYCAST_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not stage the pinned Flycast AppImage."
+    fi
+
+    FLYCAST_CANDIDATE_SHA256="$(
+        sha256sum "$FLYCAST_INSTALL_CANDIDATE" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$FLYCAST_CANDIDATE_SHA256" != "$FLYCAST_EXPECTED_SHA256" ]]; then
+        rm -f -- "$FLYCAST_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Staged Flycast AppImage failed SHA-256 verification."
+    fi
+
+    if ! mv -fT -- "$FLYCAST_INSTALL_CANDIDATE" "$FLYCAST_EXE"; then
+        rm -f -- "$FLYCAST_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not promote the pinned Flycast AppImage."
+    fi
+
+    cat > "$FLYCAST_DIR/VERSION.txt" <<EOF
+BareFront managed emulator
+Emulator: Flycast
+Release: $FLYCAST_VERSION
+Source: https://github.com/flyinghead/flycast
+Asset: $FLYCAST_ASSET_NAME
+EOF
+
+    rm -rf "$TEMP_DIR"
+
+    echo
+    echo "Flycast AppImage installed."
+fi
+
+
+# ------------------------------------------------------------
+# Dreamcast firmware layout
+# ------------------------------------------------------------
+
+echo
+echo "Preparing Dreamcast firmware layout..."
+
+# Flycast looks for Dreamcast firmware inside a folder named
+# "data" beside the emulator.
+#
+# BareFront keeps the user's ORIGINAL verified firmware in:
+#
+#   bios/dreamcast/
+#
+# dc_boot.bin is effectively read-only firmware, so Flycast's
+# expected filename can safely be a symbolic link to that file.
+#
+# dc_flash.bin is writable console flash/NVRAM. We deliberately
+# do NOT point Flycast at the original BIOS copy because Flycast
+# may modify it during normal use. Instead the working copy lives
+# under saves/dreamcast/.
+#
+# The future BIOS checker will verify the user's source flash file
+# and seed the writable copy when necessary.
+
+FLYCAST_BOOT_LINK="$FLYCAST_DATA_DIR/dc_boot.bin"
+FLYCAST_FLASH_LINK="$FLYCAST_DATA_DIR/dc_flash.bin"
+
+BAREFRONT_DC_BOOT="$BAREFRONT_DIR/bios/dreamcast/dc_boot.bin"
+BAREFRONT_DC_FLASH_WORKING="$BAREFRONT_DIR/saves/dreamcast/dc_flash.bin"
+
+
+ensure_simple_symlink()
+{
+    local target="$1"
+    local link_path="$2"
+    local description="$3"
+
+    if [[ -L "$link_path" ]]; then
+
+        local current_target
+        current_target="$(readlink "$link_path")"
+
+        if [[ "$current_target" == "$target" ]]; then
+            echo "  $description: OK"
+        else
+            echo
+            echo "WARNING: Existing symbolic link:"
+            echo "  $link_path"
+            echo "points to:"
+            echo "  $current_target"
+            echo "Expected:"
+            echo "  $target"
+            echo "Leaving it untouched."
+        fi
+
+    elif [[ -e "$link_path" ]]; then
+
+        echo
+        echo "WARNING: A real file already exists at:"
+        echo "  $link_path"
+        echo "BareFront will not overwrite it."
+
+    else
+
+        # Linux allows a symbolic link to point at a file which
+        # does not exist yet. The link becomes valid automatically
+        # when the user later supplies the target file.
+        ln -s "$target" "$link_path"
+
+        echo "  $description: linked"
+        echo "    $link_path"
+        echo "      -> $target"
+
+    fi
+}
+
+
+ensure_simple_symlink \
+    "$BAREFRONT_DC_BOOT" \
+    "$FLYCAST_BOOT_LINK" \
+    "Dreamcast boot ROM"
+
+ensure_simple_symlink \
+    "$BAREFRONT_DC_FLASH_WORKING" \
+    "$FLYCAST_FLASH_LINK" \
+    "Dreamcast writable flash"
+
+
+# ------------------------------------------------------------
+# Flycast BareFront controller helper
+# Share hold = exit; LB+RB+Y = native Flycast menu
+# ------------------------------------------------------------
+
+FLYCAST_CONTROL_SOURCE="$BAREFRONT_DIR/src/flycast_controller_helper.cpp"
+FLYCAST_CONTROL_DIR="$BAREFRONT_DIR/emulators/flycast"
+FLYCAST_CONTROL_HELPER="$FLYCAST_CONTROL_DIR/flycast_controller_helper"
+
+if [[ ! -f "$FLYCAST_CONTROL_SOURCE" ]]; then
+    die "Flycast controller helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "Flycast controller helper build dependencies are missing."
+fi
+
+mkdir -p "$FLYCAST_CONTROL_DIR"
+
+if [[ ! -x "$FLYCAST_CONTROL_HELPER" ]] ||
+   [[ "$FLYCAST_CONTROL_SOURCE" -nt "$FLYCAST_CONTROL_HELPER" ]]
+then
+    echo
+    echo "Building Flycast BareFront controller helper..."
+
+    FLYCAST_CONTROL_TEMP="$(
+        mktemp "$FLYCAST_CONTROL_DIR/.flycast-control-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra         "$FLYCAST_CONTROL_SOURCE"         -o "$FLYCAST_CONTROL_TEMP"         $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$FLYCAST_CONTROL_TEMP"
+        die "Flycast controller helper compilation failed."
+    fi
+
+    chmod 0755 "$FLYCAST_CONTROL_TEMP"
+    mv -fT -- "$FLYCAST_CONTROL_TEMP" "$FLYCAST_CONTROL_HELPER"
+
+    echo "Flycast controller helper built."
+else
+    echo
+    echo "Flycast controller helper already current."
+fi
+
+if [[ ! -x "$FLYCAST_CONTROL_HELPER" ]]; then
+    die "Flycast controller helper verification failed."
+fi
+
+
+# ------------------------------------------------------------
+# Flycast BareFront runtime integration
+# ------------------------------------------------------------
+
+FLYCAST_CONFIG_DIR="$HOME/.config/flycast"
+FLYCAST_MAPPING_DIR="$FLYCAST_CONFIG_DIR/mappings"
+FLYCAST_CONFIG="$FLYCAST_CONFIG_DIR/emu.cfg"
+FLYCAST_KEYBOARD_MAPPING="$FLYCAST_MAPPING_DIR/SDL_Keyboard.cfg"
+
+mkdir -p "$FLYCAST_CONFIG_DIR" "$FLYCAST_MAPPING_DIR"
+
+if [[ ! -f "$FLYCAST_CONFIG" ]]; then
+
+    cat > "$FLYCAST_CONFIG" <<EOF
+[config]
+UseReios = no
+FastGDRomLoad = no
+Dreamcast.BiosPath = $FLYCAST_DATA_DIR
+rend.Resolution = 480
+rend.IntegerScale = no
+rend.LinearInterpolation = no
+rend.AnisotropicFiltering = 1
+rend.TextureFiltering = 0
+rend.TextureUpscale2 = 1
+rend.WideScreen = no
+rend.SuperWideScreen = no
+rend.WidescreenGameHacks = no
+rend.ScreenStretching = 100
+EOF
+
+    echo "  Flycast BareFront config: CREATED"
+
+else
+
+    echo "  Flycast config already exists: PRESERVED"
+
+fi
+
+
+# BareFront owns only the presentation/appliance keys below.
+# Preserve every unrelated Flycast and user-managed setting.
+python3 - "$FLYCAST_CONFIG" "$FLYCAST_DATA_DIR" <<'PYFLYCAST_CONFIG'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+data_dir = sys.argv[2]
+
+lines = path.read_text().splitlines()
+
+
+def set_value(section, key, value):
+    header = f"[{section}]"
+
+    try:
+        section_start = lines.index(header)
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+
+        lines.extend([
+            header,
+            f"{key} = {value}",
+            "",
+        ])
+        return
+
+    section_end = len(lines)
+
+    for i in range(section_start + 1, len(lines)):
+        if lines[i].startswith("[") and lines[i].endswith("]"):
+            section_end = i
+            break
+
+    for i in range(section_start + 1, section_end):
+        if "=" not in lines[i]:
+            continue
+
+        existing_key = lines[i].split("=", 1)[0].strip()
+
+        if existing_key == key:
+            lines[i] = f"{key} = {value}"
+            return
+
+    lines.insert(section_end, f"{key} = {value}")
+
+
+owned = {
+    "UseReios": "no",
+    "FastGDRomLoad": "no",
+    "Dreamcast.BiosPath": data_dir,
+    "rend.Resolution": "480",
+    "rend.IntegerScale": "no",
+    "rend.LinearInterpolation": "no",
+    "rend.AnisotropicFiltering": "1",
+    "rend.TextureFiltering": "0",
+    "rend.TextureUpscale2": "1",
+    "rend.WideScreen": "no",
+    "rend.SuperWideScreen": "no",
+    "rend.WidescreenGameHacks": "no",
+    "rend.ScreenStretching": "100",
+}
+
+for key, value in owned.items():
+    set_value("config", key, value)
+
+path.write_text("\n".join(lines) + "\n")
+PYFLYCAST_CONFIG
+
+echo "  Flycast BareFront presentation baseline: ENFORCED"
+
+
+if [[ ! -f "$FLYCAST_KEYBOARD_MAPPING" ]]; then
+
+    cat > "$FLYCAST_KEYBOARD_MAPPING" <<'EOF'
+[digital]
+bind0 = 4:btn_d
+bind1 = 6:btn_b
+bind10 = 27:btn_a
+bind11 = 40:btn_start
+bind12 = 41:btn_escape
+bind13 = 43:btn_menu
+bind14 = 44:btn_fforward
+bind15 = 69:btn_screenshot
+bind16 = 79:btn_dpad1_right
+bind17 = 80:btn_dpad1_left
+bind18 = 81:btn_dpad1_down
+bind19 = 82:btn_dpad1_up
+bind2 = 7:btn_y
+bind3 = 9:btn_trigger_left
+bind4 = 12:btn_analog_up
+bind5 = 13:btn_analog_left
+bind6 = 14:btn_analog_down
+bind7 = 15:btn_analog_right
+bind8 = 22:btn_x
+bind9 = 25:btn_trigger_right
+
+[emulator]
+dead_zone = 10
+mapping_name = Keyboard
+rumble_power = 100
+saturation = 100
+triggers =
+version = 4
+EOF
+
+    echo "  Flycast keyboard baseline: CREATED"
+
+else
+
+    echo "  Flycast keyboard mapping already exists: PRESERVED"
+
+    if ! grep -Fq '41:btn_escape' "$FLYCAST_KEYBOARD_MAPPING"; then
+        echo "  WARNING: existing Flycast keyboard map does not bind"
+        echo "           Escape to the emulator Exit action."
+    fi
+
+fi
+
+
+# Xbox Series X controller baseline.
+# BareFront owns Share externally so a quick Share tap is harmless.
+# The helper turns a 1500 ms Share hold into Escape and LB+RB+Y
+# into Flycast's native menu. Keep numbered digital binds contiguous.
+FLYCAST_XBOX_MAPPING_SOURCE="$BAREFRONT_DIR/assets/config/flycast/SDL_Xbox Series X Controller.cfg"
+FLYCAST_XBOX_MAPPING="$FLYCAST_MAPPING_DIR/SDL_Xbox Series X Controller.cfg"
+
+if grep -Fq '11:btn_escape' "$FLYCAST_XBOX_MAPPING_SOURCE"; then
+    die "Bundled Flycast mapping still assigns Guide directly to Exit."
+fi
+
+for expected in \
+    'bind8 = 256:btn_dpad1_up' \
+    'bind9 = 257:btn_dpad1_down' \
+    'bind10 = 258:btn_dpad1_left' \
+    'bind11 = 259:btn_dpad1_right'
+do
+    grep -Fqx "$expected" "$FLYCAST_XBOX_MAPPING_SOURCE" ||
+        die "Bundled Flycast controller mapping failed validation."
+done
+
+if [[ ! -f "$FLYCAST_XBOX_MAPPING" ]]; then
+
+    install -m 0644 "$FLYCAST_XBOX_MAPPING_SOURCE" "$FLYCAST_XBOX_MAPPING"
+
+    echo "  Flycast Xbox controller baseline: CREATED"
+
+else
+
+    # Upgrade only known BareFront-owned historical mappings.
+    # Never overwrite a customised Flycast mapping.
+    FLYCAST_OLD_SELECT_MAP_SHA256="b2f25c244ecd2d3694d4ff011374cbefee9b98254a2948ae52dffb80c30d503e"
+    FLYCAST_PRE_HOLD_MAP_SHA256="e22f94888bdb24166aeabd2dcb24d25f6cb48514c7b36b339598c4e384fafd0c"
+
+    FLYCAST_INSTALLED_XBOX_SHA256="$(
+        sha256sum "$FLYCAST_XBOX_MAPPING" | awk '{print $1}'
+    )"
+
+    if [[ "$FLYCAST_INSTALLED_XBOX_SHA256" == "$FLYCAST_OLD_SELECT_MAP_SHA256" ||
+          "$FLYCAST_INSTALLED_XBOX_SHA256" == "$FLYCAST_PRE_HOLD_MAP_SHA256" ]]
+    then
+        FLYCAST_XBOX_MAPPING_BACKUP="$(
+            mktemp "${FLYCAST_XBOX_MAPPING}.pre-guide-hold.XXXXXX"
+        )"
+
+        cp -p "$FLYCAST_XBOX_MAPPING" "$FLYCAST_XBOX_MAPPING_BACKUP" ||
+            die "Could not back up the previous Flycast Xbox mapping."
+
+        install -m 0644 "$FLYCAST_XBOX_MAPPING_SOURCE" "$FLYCAST_XBOX_MAPPING" ||
+            die "Could not migrate the Flycast Xbox mapping."
+
+        echo "  Flycast Share-hold controller mapping: MIGRATED"
+        echo "  Previous mapping: $FLYCAST_XBOX_MAPPING_BACKUP"
+
+    else
+
+        echo "  Flycast Xbox controller mapping already exists: PRESERVED"
+
+        if grep -Fq '11:btn_escape' "$FLYCAST_XBOX_MAPPING"; then
+            echo "  WARNING: custom Flycast mapping still assigns"
+            echo "           Share directly to Exit."
+        fi
+
+    fi
+
+fi
+
+
+# BareFront-owned launcher adapter.
+# XDG_DATA_HOME routes VMU/NVRAM data into BareFront/saves.
+# Flycast renders a neutral 640x480 surface; Gamescope owns the
+# 2x integer nearest presentation; the selected shader remains external.
+if [[ ! -x "$BAREFRONT_DIR/scripts/launch_flycast.sh" ]]; then
+    die "Tracked Flycast launcher is missing or not executable."
+fi
+
+# Compatibility adapter. The implementation is tracked under scripts/.
+# Keep this path stable for existing barefront.ini installations.
+cat > "$FLYCAST_LAUNCHER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec "$ROOT/scripts/launch_flycast.sh" "$@"
+EOF
+
+chmod +x "$FLYCAST_LAUNCHER"
+
+echo "  Flycast BareFront launcher: READY"
+
+
+# ------------------------------------------------------------
+# Record firmware instructions for the later checker
+# ------------------------------------------------------------
+
+cat > "$FLYCAST_DIR/FIRMWARE_LAYOUT.txt" <<EOF
+BareFront Dreamcast firmware layout
+
+Original firmware supplied by user:
+  $BAREFRONT_DIR/bios/dreamcast/dc_boot.bin
+  $BAREFRONT_DIR/bios/dreamcast/dc_flash.bin
+
+Flycast runtime paths:
+  $FLYCAST_DATA_DIR/dc_boot.bin
+    -> original verified boot ROM
+
+  $FLYCAST_DATA_DIR/dc_flash.bin
+    -> writable working copy:
+       $BAREFRONT_DIR/saves/dreamcast/dc_flash.bin
+
+The future BareFront BIOS checker will verify source firmware
+and create/update the working dc_flash.bin when appropriate.
+EOF
+
+
+# ------------------------------------------------------------
+# Final Flycast verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying Flycast..."
+
+if [[ -x "$FLYCAST_EXE" ]]; then
+    echo "  Executable: OK"
+    echo "  $FLYCAST_EXE"
+else
+    die "Flycast installation verification failed."
+fi
+
+FLYCAST_FINAL_SHA256="$(
+    sha256sum "$FLYCAST_EXE" |
+        awk '{print $1}'
+)"
+
+if [[ "$FLYCAST_FINAL_SHA256" != "$FLYCAST_EXPECTED_SHA256" ]]; then
+    die "Installed Flycast does not match the pinned SHA-256."
+fi
+
+echo "  Executable SHA-256: OK"
+
+if [[ -x "$FLYCAST_LAUNCHER" ]]; then
+    echo "  BareFront wrapper: OK"
+else
+    die "Flycast BareFront wrapper is missing."
+fi
+
+if [[ -x "$FLYCAST_GAMESCOPE" ]]; then
+    echo "  Gamescope: OK"
+else
+    die "Gamescope is required for Dreamcast presentation."
+fi
+
+if [[ -f "$FLYCAST_OVERLAY" ]]; then
+    echo "  Dreamcast presentation overlay: OK"
+else
+    die "Dreamcast presentation overlay is missing."
+fi
+
+for expected in \
+    'UseReios = no' \
+    'FastGDRomLoad = no' \
+    "Dreamcast.BiosPath = $FLYCAST_DATA_DIR" \
+    'rend.Resolution = 480' \
+    'rend.IntegerScale = no' \
+    'rend.LinearInterpolation = no' \
+    'rend.AnisotropicFiltering = 1' \
+    'rend.TextureFiltering = 0' \
+    'rend.TextureUpscale2 = 1' \
+    'rend.WideScreen = no' \
+    'rend.SuperWideScreen = no' \
+    'rend.WidescreenGameHacks = no' \
+    'rend.ScreenStretching = 100'
+do
+    grep -Fqx "$expected" "$FLYCAST_CONFIG" ||
+        die "Flycast presentation configuration verification failed."
+done
+
+echo "  Presentation configuration: OK"
+
+if [[ "$(readlink "$FLYCAST_BOOT_LINK" 2>/dev/null || true)" == "$BAREFRONT_DC_BOOT" ]]; then
+    echo "  Boot ROM link: OK"
+else
+    die "Flycast boot ROM link verification failed."
+fi
+
+if [[ "$(readlink "$FLYCAST_FLASH_LINK" 2>/dev/null || true)" == "$BAREFRONT_DC_FLASH_WORKING" ]]; then
+    echo "  Writable flash link: OK"
+else
+    die "Flycast writable flash link verification failed."
+fi
+
+echo
+echo "Flycast launch command will later use:"
+echo "  {rom}"
+echo
+echo "Flycast stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Part 5: BigPEmu
+# ============================================================
+
+heading "STAGE 3B / BIGPEMU"
+
+BIGPEMU_DIR="$BAREFRONT_DIR/emulators/bigpemu"
+BIGPEMU_LAUNCHER="$BIGPEMU_DIR/BigPEmu"
+BIGPEMU_WRAPPER="$BAREFRONT_DIR/scripts/launch_bigpemu.sh"
+BIGPEMU_ESC_SOURCE="$BAREFRONT_DIR/src/bigpemu_esc_helper.cpp"
+BIGPEMU_ESC_HELPER="$BIGPEMU_DIR/bigpemu_esc_helper"
+BIGPEMU_GUIDE_SOURCE="$BAREFRONT_DIR/src/bigpemu_guide_exit_helper.cpp"
+BIGPEMU_GUIDE_HELPER="$BIGPEMU_DIR/bigpemu_guide_exit_helper"
+BIGPEMU_GAMESCOPE="$BAREFRONT_DIR/runtime/presentation/gamescope/gamescope"
+BIGPEMU_OVERLAY="$BAREFRONT_DIR/assets/overlays/jaguar.png"
+BIGPEMU_CONFIG_BASELINE="$BAREFRONT_DIR/assets/config/bigpemu/BigPEmuConfig.bigpcfg"
+BIGPEMU_USERDATA_DIR="$BIGPEMU_DIR/bigpemu/bigpemu_userdata"
+BIGPEMU_CONFIG="$BIGPEMU_USERDATA_DIR/BigPEmuConfig.bigpcfg"
+BIGPEMU_CONFIG_BASELINE_SHA256="eaafc829ec705351e10d799dc23922a80195f10caa4800fa4cc329410d7650ff"
+
+# BigPEmu does not currently publish releases through a package
+# manager or machine-readable release API.
+#
+# For reproducibility BareFront pins the current known stable
+# Linux x64 build and verifies the exact size and upstream
+# FNV-1a hash before extracting it.
+BIGPEMU_VERSION="1.221"
+BIGPEMU_URL="https://www.richwhitehouse.com/jaguar/builds/BigPEmu_Linux64_v1221.tar.gz"
+BIGPEMU_EXPECTED_SIZE="8912737"
+BIGPEMU_EXPECTED_FNV="C1B241BBFA5135CB"
+BIGPEMU_EXPECTED_EXEC_SHA256="2f7cc9c80c1b0cafae432899ace8cf979fa49cf9aa28b572801d7a34480cf8ea"
+
+echo "BareFront uses BigPEmu for:"
+echo "  Atari Jaguar"
+echo
+echo "Pinned stable release:"
+echo "  $BIGPEMU_VERSION"
+echo
+echo "Install location:"
+echo "  $BIGPEMU_DIR"
+echo
+
+
+BIGPEMU_UPSTREAM_EXEC="$BIGPEMU_DIR/bigpemu/bigpemu"
+
+BIGPEMU_INSTALLED_EXEC_SHA256=""
+
+if [[ -f "$BIGPEMU_UPSTREAM_EXEC" ]]; then
+    BIGPEMU_INSTALLED_EXEC_SHA256="$(
+        sha256sum "$BIGPEMU_UPSTREAM_EXEC" |
+            awk '{print $1}'
+    )"
+fi
+
+BIGPEMU_MANAGED=0
+
+if [[ -f "$BIGPEMU_DIR/VERSION.txt" ]] &&
+   grep -q '^BareFront managed emulator$' "$BIGPEMU_DIR/VERSION.txt"
+then
+    BIGPEMU_MANAGED=1
+fi
+
+NEED_BIGPEMU_INSTALL=1
+
+if [[ "$BIGPEMU_MANAGED" -eq 1 &&
+      "$BIGPEMU_INSTALLED_EXEC_SHA256" == "$BIGPEMU_EXPECTED_EXEC_SHA256" ]]
+then
+
+    chmod +x "$BIGPEMU_UPSTREAM_EXEC"
+
+    if [[ -L "$BIGPEMU_LAUNCHER" ]]; then
+
+        if [[ "$(readlink "$BIGPEMU_LAUNCHER")" != "$BIGPEMU_UPSTREAM_EXEC" ]]; then
+            die "Existing BigPEmu launcher link points to an unexpected target."
+        fi
+
+    elif [[ -e "$BIGPEMU_LAUNCHER" ]]; then
+
+        die "Existing BigPEmu launcher path is not BareFront's symbolic link."
+
+    else
+
+        ln -s "$BIGPEMU_UPSTREAM_EXEC" "$BIGPEMU_LAUNCHER"
+        echo "BigPEmu launcher link repaired."
+
+    fi
+
+    echo "BigPEmu pinned build is already installed."
+    echo "  Executable SHA-256: OK"
+    echo "Action: SKIP"
+
+    NEED_BIGPEMU_INSTALL=0
+
+elif [[ -e "$BIGPEMU_DIR" ]]; then
+
+    if [[ -d "$BIGPEMU_DIR" ]] &&
+       [[ -z "$(find "$BIGPEMU_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+    then
+        rmdir "$BIGPEMU_DIR"
+    else
+        echo
+        echo "Existing BigPEmu installation does not match BareFront's exact pin."
+        echo "BareFront will not replace it automatically because BigPEmu's"
+        echo "local-data directory may contain user configuration and screenshots."
+        die "Inspect the existing BigPEmu installation before continuing."
+    fi
+
+fi
+
+
+if [[ "$NEED_BIGPEMU_INSTALL" -eq 1 ]]; then
+
+    BIGPEMU_PARENT="$(dirname "$BIGPEMU_DIR")"
+    mkdir -p "$BIGPEMU_PARENT"
+
+    TEMP_DIR="$(mktemp -d)"
+    TEMP_ARCHIVE="$TEMP_DIR/BigPEmu.tar.gz"
+    EXTRACT_DIR="$TEMP_DIR/extracted"
+
+    mkdir -p "$EXTRACT_DIR"
+
+    echo "Downloading official BigPEmu Linux x64 archive..."
+
+    if ! curl -fL --progress-bar \
+        "$BIGPEMU_URL" \
+        -o "$TEMP_ARCHIVE"
+    then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu download failed."
+    fi
+
+
+    # --------------------------------------------------------
+    # Verify exact byte size
+    #
+    # stat -c%s prints only the file size in bytes.
+    # --------------------------------------------------------
+
+    ACTUAL_SIZE="$(stat -c%s "$TEMP_ARCHIVE")"
+
+    echo
+    echo "Checking download size..."
+    echo "  Expected: $BIGPEMU_EXPECTED_SIZE bytes"
+    echo "  Actual:   $ACTUAL_SIZE bytes"
+
+    if [[ "$ACTUAL_SIZE" != "$BIGPEMU_EXPECTED_SIZE" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu file-size verification failed."
+    fi
+
+    echo "  Size: OK"
+
+
+    # --------------------------------------------------------
+    # Verify BigPEmu's upstream 64-bit FNV-1a hash.
+    #
+    # The BigPEmu author publishes FNV-1a rather than SHA-256.
+    # Python is used here only to calculate that exact algorithm
+    # reliably across Linux shells.
+    # --------------------------------------------------------
+
+    ACTUAL_FNV="$(
+        python3 - "$TEMP_ARCHIVE" <<'PY'
+import sys
+
+path = sys.argv[1]
+
+# 64-bit FNV-1a constants.
+h = 0xcbf29ce484222325
+prime = 0x100000001b3
+mask = 0xffffffffffffffff
+
+with open(path, "rb") as f:
+    while True:
+        block = f.read(1024 * 1024)
+        if not block:
+            break
+
+        for byte in block:
+            h ^= byte
+            h = (h * prime) & mask
+
+print(f"{h:016X}")
+PY
+    )"
+
+    echo
+    echo "Checking upstream FNV-1a hash..."
+    echo "  Expected: $BIGPEMU_EXPECTED_FNV"
+    echo "  Actual:   $ACTUAL_FNV"
+
+    if [[ "$ACTUAL_FNV" != "$BIGPEMU_EXPECTED_FNV" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu FNV-1a verification failed."
+    fi
+
+    echo "  FNV-1a: OK"
+
+
+    # --------------------------------------------------------
+    # Extract without changing the upstream layout.
+    #
+    # tar:
+    #   -x = extract
+    #   -z = decompress gzip
+    #   -f = archive filename follows
+    #   -C = extract into this directory
+    # --------------------------------------------------------
+
+    echo
+    echo "Extracting BigPEmu..."
+
+    if ! tar -xzf "$TEMP_ARCHIVE" -C "$EXTRACT_DIR"; then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu archive extraction failed."
+    fi
+
+
+    # Locate the real executable inside the preserved archive
+    # structure. The current Linux archive contains a top-level
+    # bigpemu directory, but discovery avoids depending on that
+    # nesting forever.
+    FOUND_BIGPEMU="$(
+        find "$EXTRACT_DIR" \
+            -type f \
+            -name 'bigpemu' \
+            -print \
+            -quit
+    )"
+
+    if [[ -z "$FOUND_BIGPEMU" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu executable was not found in the official archive."
+    fi
+
+    chmod +x "$FOUND_BIGPEMU"
+
+    BIGPEMU_INSTALL_CANDIDATE="$(
+        mktemp -d "$BIGPEMU_PARENT/.bigpemu-install.XXXXXX"
+    )"
+
+    chmod 0755 "$BIGPEMU_INSTALL_CANDIDATE"
+
+    if ! cp -a "$EXTRACT_DIR"/. "$BIGPEMU_INSTALL_CANDIDATE"/; then
+        rm -rf "$BIGPEMU_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not stage the BigPEmu installation tree."
+    fi
+
+    BIGPEMU_CANDIDATE_EXEC="$BIGPEMU_INSTALL_CANDIDATE/bigpemu/bigpemu"
+
+    if [[ ! -f "$BIGPEMU_CANDIDATE_EXEC" ]]; then
+        rm -rf "$BIGPEMU_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Staged BigPEmu executable is missing."
+    fi
+
+    chmod +x "$BIGPEMU_CANDIDATE_EXEC"
+
+    BIGPEMU_CANDIDATE_EXEC_SHA256="$(
+        sha256sum "$BIGPEMU_CANDIDATE_EXEC" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$BIGPEMU_CANDIDATE_EXEC_SHA256" != "$BIGPEMU_EXPECTED_EXEC_SHA256" ]]; then
+        rm -rf "$BIGPEMU_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Extracted BigPEmu executable failed SHA-256 verification."
+    fi
+
+    cat > "$BIGPEMU_INSTALL_CANDIDATE/VERSION.txt" <<EOF
+BareFront managed emulator
+Emulator: BigPEmu
+Release: $BIGPEMU_VERSION
+Source: https://www.richwhitehouse.com/jaguar/
+Linux archive: BigPEmu_Linux64_v1221.tar.gz
+Expected size: $BIGPEMU_EXPECTED_SIZE bytes
+Expected FNV-1a 64: $BIGPEMU_EXPECTED_FNV
+Expected executable SHA256: $BIGPEMU_EXPECTED_EXEC_SHA256
+EOF
+
+    if ! mv -T "$BIGPEMU_INSTALL_CANDIDATE" "$BIGPEMU_DIR"; then
+        rm -rf "$BIGPEMU_INSTALL_CANDIDATE"
+        rm -rf "$TEMP_DIR"
+        die "Could not promote the staged BigPEmu installation."
+    fi
+
+    rm -rf "$TEMP_DIR"
+
+    if [[ -e "$BIGPEMU_LAUNCHER" || -L "$BIGPEMU_LAUNCHER" ]]; then
+        die "Unexpected BigPEmu launcher path after fresh installation."
+    fi
+
+    ln -s "$BIGPEMU_UPSTREAM_EXEC" "$BIGPEMU_LAUNCHER"
+
+    echo
+    echo "BigPEmu installed."
+fi
+
+
+# ------------------------------------------------------------
+# Final verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying BigPEmu..."
+
+if [[ ! -f "$BIGPEMU_UPSTREAM_EXEC" ]]; then
+    die "BigPEmu upstream executable is missing."
+fi
+
+BIGPEMU_FINAL_EXEC_SHA256="$(
+    sha256sum "$BIGPEMU_UPSTREAM_EXEC" |
+        awk '{print $1}'
+)"
+
+if [[ "$BIGPEMU_FINAL_EXEC_SHA256" != "$BIGPEMU_EXPECTED_EXEC_SHA256" ]]; then
+    die "Installed BigPEmu executable does not match the pinned SHA-256."
+fi
+
+echo "  Executable SHA-256: OK"
+
+if [[ ! -L "$BIGPEMU_LAUNCHER" ||
+      "$(readlink "$BIGPEMU_LAUNCHER" 2>/dev/null || true)" != "$BIGPEMU_UPSTREAM_EXEC" ||
+      ! -x "$BIGPEMU_LAUNCHER" ]]
+then
+    die "BigPEmu launcher-link verification failed."
+fi
+
+echo "  BareFront launcher: OK"
+echo "  $BIGPEMU_LAUNCHER"
+echo "    -> $(readlink "$BIGPEMU_LAUNCHER")"
+
+if [[ ! -f "$BIGPEMU_DIR/VERSION.txt" ]] ||
+   ! grep -q '^BareFront managed emulator$' "$BIGPEMU_DIR/VERSION.txt"
+then
+    die "BigPEmu managed-version marker verification failed."
+fi
+
+echo "  Managed version marker: OK"
+
+
+# ------------------------------------------------------------
+# BareFront BigPEmu portable keyboard baseline
+#
+# BigPEmu changes configuration location when BareFront launches
+# it with -localdata. The normal desktop configuration is therefore
+# deliberately separate from BareFront's private configuration.
+#
+# Fresh BareFront installs receive a controller-independent keyboard
+# baseline. BareFront's SDL helper translates normalized controller
+# input to these keys, so BigPEmu does not depend on a host-specific
+# SDL controller GUID.
+#
+# The exact historical BareFront Xbox mapping is safely removed from
+# existing configurations. Any other/custom controller mapping is
+# preserved untouched.
+# ------------------------------------------------------------
+
+if [[ ! -s "$BIGPEMU_CONFIG_BASELINE" ]]; then
+    die "BigPEmu input baseline is missing."
+fi
+
+BIGPEMU_CONFIG_BASELINE_ACTUAL_SHA256="$(
+    sha256sum "$BIGPEMU_CONFIG_BASELINE" |
+        awk '{print $1}'
+)"
+
+if [[ "$BIGPEMU_CONFIG_BASELINE_ACTUAL_SHA256" != "$BIGPEMU_CONFIG_BASELINE_SHA256" ]]; then
+    die "Unexpected BigPEmu input baseline."
+fi
+
+
+# Validate the tracked portable baseline before using it.
+
+python3 - "$BIGPEMU_CONFIG_BASELINE" <<'PY_VALIDATE_BIGPEMU'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+input_cfg = cfg["BigPEmuConfig"]["Input"]
+
+keyboard = []
+controller = []
+device_ids = set()
+
+for key, device in input_cfg.items():
+
+    if not key.startswith("Device"):
+        continue
+
+    if not isinstance(device, dict):
+        continue
+
+    for binding in device.get("Bindings", []):
+
+        for trigger in binding.get("Triggers", []):
+
+            if trigger.get("B_KB") is True:
+                keyboard.append(trigger)
+
+            elif trigger.get("B_KB") is False:
+                controller.append(trigger)
+
+            for field in ("B_DevID", "M_DevID"):
+                value = trigger.get(field)
+
+                if value:
+                    device_ids.add(value)
+
+
+if input_cfg.get("DeviceCount") != 2:
+    raise SystemExit(
+        "Unexpected BigPEmu baseline DeviceCount"
+    )
+
+if len(keyboard) != 24:
+    raise SystemExit(
+        "Unexpected BigPEmu baseline keyboard trigger count"
+    )
+
+if controller:
+    raise SystemExit(
+        "BigPEmu portable baseline contains controller triggers"
+    )
+
+if device_ids:
+    raise SystemExit(
+        "BigPEmu portable baseline contains device-specific IDs"
+    )
+
+if cfg["BigPEmuConfig"].get("RecentFiles") != []:
+    raise SystemExit(
+        "BigPEmu baseline contains recent-file history"
+    )
+
+if cfg["BigPEmuConfig"].get("SetCart") not in (None, ""):
+    raise SystemExit(
+        "BigPEmu baseline contains cartridge history"
+    )
+
+if cfg["BigPEmuConfig"].get("SetDisc") not in (None, ""):
+    raise SystemExit(
+        "BigPEmu baseline contains disc history"
+    )
+PY_VALIDATE_BIGPEMU
+
+
+mkdir -p "$BIGPEMU_USERDATA_DIR"
+
+
+if [[ ! -e "$BIGPEMU_CONFIG" ]]; then
+
+    install \
+        -m 0644 \
+        "$BIGPEMU_CONFIG_BASELINE" \
+        "$BIGPEMU_CONFIG"
+
+    echo "  BigPEmu portable input baseline: CREATED"
+
+
+elif [[ ! -f "$BIGPEMU_CONFIG" || -L "$BIGPEMU_CONFIG" ]]; then
+
+    die "Unexpected BigPEmu configuration path."
+
+
+else
+
+    BIGPEMU_CONFIG_TEMP="$(
+        mktemp \
+            "$BIGPEMU_USERDATA_DIR/.BigPEmuConfig.input.XXXXXX"
+    )"
+
+    if ! BIGPEMU_CONFIG_ACTION="$(
+        python3 - \
+            "$BIGPEMU_CONFIG" \
+            "$BIGPEMU_CONFIG_BASELINE" \
+            "$BIGPEMU_CONFIG_TEMP" <<'PY_MIGRATE_BIGPEMU'
+import copy
+import hashlib
+import json
+import sys
+
+existing_path, _baseline_path, output_path = sys.argv[1:4]
+
+OLD_CONTROLLER_SIGNATURE = (
+    "c81f4074298048cbb7f5998fd5a63ace"
+    "515210d5a0e4af13f5ab638b79eb31f2"
+)
+
+with open(existing_path, "r", encoding="utf-8") as f:
+    existing = json.load(f)
+
+
+def controller_entries(cfg):
+    result = []
+
+    input_cfg = cfg["BigPEmuConfig"]["Input"]
+
+    for device_name in sorted(
+        key
+        for key in input_cfg
+        if key.startswith("Device")
+        and isinstance(input_cfg[key], dict)
+    ):
+        device = input_cfg[device_name]
+
+        for binding_index, binding in enumerate(
+            device.get("Bindings", [])
+        ):
+            for trigger in binding.get("Triggers", []):
+
+                if trigger.get("B_KB") is False:
+                    result.append({
+                        "device": device_name,
+                        "binding": binding_index,
+                        "trigger": trigger,
+                    })
+
+    return result
+
+
+def controller_signature(cfg):
+    canonical = json.dumps(
+        controller_entries(cfg),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def without_controller_triggers(cfg):
+    result = copy.deepcopy(cfg)
+    input_cfg = result["BigPEmuConfig"]["Input"]
+
+    for key, device in input_cfg.items():
+
+        if not key.startswith("Device"):
+            continue
+
+        if not isinstance(device, dict):
+            continue
+
+        for binding in device.get("Bindings", []):
+
+            binding["Triggers"] = [
+                trigger
+                for trigger in binding.get("Triggers", [])
+                if trigger.get("B_KB") is not False
+            ]
+
+    return result
+
+
+existing_controller = controller_entries(existing)
+
+# No controller-specific bindings means this configuration is already
+# portable or intentionally keyboard-only. Preserve it exactly.
+if not existing_controller:
+    print("PRESERVE")
+    raise SystemExit(0)
+
+
+# Any controller mapping other than BareFront's exact historical mapping
+# may belong to the user. Preserve it untouched.
+if controller_signature(existing) != OLD_CONTROLLER_SIGNATURE:
+    print("PRESERVE")
+    raise SystemExit(0)
+
+
+before = copy.deepcopy(existing)
+migrated = without_controller_triggers(existing)
+
+
+if controller_entries(migrated):
+    raise SystemExit(
+        "BigPEmu legacy controller triggers remain after migration"
+    )
+
+
+# Removing the known controller triggers must be the only change.
+if without_controller_triggers(before) != migrated:
+    raise SystemExit(
+        "BigPEmu migration changed unrelated configuration"
+    )
+
+
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(migrated, f, indent=4)
+    f.write("\n")
+
+
+print("MIGRATE")
+PY_MIGRATE_BIGPEMU
+    )"
+    then
+
+        rm -f -- "$BIGPEMU_CONFIG_TEMP"
+        die "BigPEmu input migration failed."
+
+    fi
+
+
+    case "$BIGPEMU_CONFIG_ACTION" in
+
+        PRESERVE)
+
+            rm -f -- "$BIGPEMU_CONFIG_TEMP"
+
+            echo \
+                "  BigPEmu input configuration: PRESERVED"
+            ;;
+
+
+        MIGRATE)
+
+            chmod \
+                --reference="$BIGPEMU_CONFIG" \
+                "$BIGPEMU_CONFIG_TEMP"
+
+            chown \
+                --reference="$BIGPEMU_CONFIG" \
+                "$BIGPEMU_CONFIG_TEMP"
+
+            if ! mv -fT \
+                "$BIGPEMU_CONFIG_TEMP" \
+                "$BIGPEMU_CONFIG"
+            then
+                rm -f -- "$BIGPEMU_CONFIG_TEMP"
+                die \
+                    "Could not migrate the BigPEmu input configuration."
+            fi
+
+            echo \
+                "  BigPEmu legacy controller mapping: MIGRATED"
+            ;;
+
+
+        *)
+
+            rm -f -- "$BIGPEMU_CONFIG_TEMP"
+
+            die \
+                "Unexpected BigPEmu input migration result."
+            ;;
+
+    esac
+
+fi
+
+
+# ------------------------------------------------------------
+# BareFront Jaguar integration
+#
+# BigPEmu reserves Esc for its own menu. BareFront therefore
+# owns Esc externally while BigPEmu is running inside Gamescope.
+# The wrapper discovers BigPEmu's nested Xwayland DISPLAY and
+# starts the existing X11 Esc helper on that display. The helper
+# terminates only BigPEmu; Gamescope then exits naturally.
+# ------------------------------------------------------------
+
+echo
+echo "Configuring BareFront Jaguar integration..."
+
+if [[ ! -f "$BIGPEMU_ESC_SOURCE" ]]; then
+    die "BigPEmu Esc helper source is missing."
+fi
+
+if [[ ! -x "$BIGPEMU_WRAPPER" ]]; then
+    die "BigPEmu BareFront wrapper is missing or not executable."
+fi
+
+if [[ ! -x "$BIGPEMU_GAMESCOPE" ]]; then
+    die "Gamescope is required for Atari Jaguar presentation."
+fi
+
+if [[ ! -f "$BIGPEMU_OVERLAY" ]]; then
+    die "Atari Jaguar presentation overlay is missing."
+fi
+
+if [[ ! -x "$BIGPEMU_ESC_HELPER" ]] || \
+   [[ "$BIGPEMU_ESC_SOURCE" -nt "$BIGPEMU_ESC_HELPER" ]]
+then
+    echo "Building BigPEmu Esc helper..."
+
+    BIGPEMU_ESC_TEMP="$(
+        mktemp "$BIGPEMU_DIR/.bigpemu-esc.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 \
+        "$BIGPEMU_ESC_SOURCE" \
+        -o "$BIGPEMU_ESC_TEMP" \
+        -lX11
+    then
+        rm -f -- "$BIGPEMU_ESC_TEMP"
+        die "BigPEmu Esc helper compilation failed."
+    fi
+
+    chmod 0755 "$BIGPEMU_ESC_TEMP"
+
+    if ! mv -fT -- "$BIGPEMU_ESC_TEMP" "$BIGPEMU_ESC_HELPER"; then
+        rm -f -- "$BIGPEMU_ESC_TEMP"
+        die "Could not promote the BigPEmu Esc helper."
+    fi
+
+    echo "Action: BUILD"
+else
+    echo "BigPEmu Esc helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$BIGPEMU_ESC_HELPER" ]]; then
+    die "BigPEmu Esc helper build failed."
+fi
+
+# ------------------------------------------------------------
+# BigPEmu Xbox Share exit helper
+# ------------------------------------------------------------
+
+if [[ ! -f "$BIGPEMU_GUIDE_SOURCE" ]]; then
+    die "BigPEmu Share helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "BigPEmu Share helper build dependencies are missing."
+fi
+
+if [[ ! -x "$BIGPEMU_GUIDE_HELPER" ]] ||
+   [[ "$BIGPEMU_GUIDE_SOURCE" -nt "$BIGPEMU_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building BigPEmu Xbox Share helper..."
+
+    BIGPEMU_GUIDE_TEMP="$(mktemp "$BIGPEMU_DIR/.bigpemu-guide.XXXXXX")"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$BIGPEMU_GUIDE_SOURCE" \
+        -o "$BIGPEMU_GUIDE_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$BIGPEMU_GUIDE_TEMP"
+        die "BigPEmu Share helper compilation failed."
+    fi
+
+    chmod 0755 "$BIGPEMU_GUIDE_TEMP"
+
+    if ! mv -fT -- "$BIGPEMU_GUIDE_TEMP" "$BIGPEMU_GUIDE_HELPER"; then
+        rm -f -- "$BIGPEMU_GUIDE_TEMP"
+        die "Could not promote the BigPEmu Share helper."
+    fi
+
+    echo "BigPEmu Xbox Share helper built."
+else
+    echo "BigPEmu Xbox Share helper already built."
+fi
+
+if [[ ! -x "$BIGPEMU_GUIDE_HELPER" ]]; then
+    die "BigPEmu Share helper verification failed."
+fi
+
+echo
+echo "BareFront Jaguar launcher:"
+echo "  $BIGPEMU_WRAPPER"
+echo
+echo "BareFront-owned controls:"
+echo "  Esc = return directly to BareFront"
+echo "  Xbox Share = return directly to BareFront"
+
+echo
+echo "BigPEmu needs no mandatory Jaguar BIOS for normal"
+echo "cartridge-image use."
+echo
+echo "BareFront launch command will later use:"
+echo "  $BIGPEMU_WRAPPER {rom}"
+echo
+echo "BigPEmu stage complete."
+
+
+# ============================================================
+# Stage 3B - Dolphin integration
+# ============================================================
+
+heading "STAGE 3B / DOLPHIN"
+
+DOLPHIN_EXE="/usr/games/dolphin-emu"
+DOLPHIN_GAMESCOPE="$BAREFRONT_DIR/runtime/presentation/gamescope/gamescope"
+DOLPHIN_WRAPPER="$BAREFRONT_DIR/scripts/launch_dolphin.sh"
+DOLPHIN_USER_DIR="$BAREFRONT_DIR/saves/gamecube/dolphin"
+DOLPHIN_OVERLAY="$BAREFRONT_DIR/assets/overlays/gamecube.png"
+DOLPHIN_GUIDE_SOURCE="$BAREFRONT_DIR/src/dolphin_guide_exit_helper.cpp"
+DOLPHIN_GUIDE_HELPER="$BAREFRONT_DIR/emulators/dolphin/dolphin_guide_exit_helper"
+DOLPHIN_GCPAD_BASELINE="$BAREFRONT_DIR/assets/config/dolphin/GCPadNew.ini"
+DOLPHIN_GCPAD="$DOLPHIN_USER_DIR/Config/GCPadNew.ini"
+
+if [[ ! -x "$DOLPHIN_EXE" ]]; then
+    die "Dolphin executable not found: $DOLPHIN_EXE"
+fi
+
+if [[ ! -x "$DOLPHIN_GAMESCOPE" ]]; then
+    die "Gamescope executable not found: $DOLPHIN_GAMESCOPE"
+fi
+
+if [[ ! -x "$DOLPHIN_WRAPPER" ]]; then
+    die "Dolphin BareFront wrapper is missing or not executable."
+fi
+
+if [[ ! -s "$DOLPHIN_OVERLAY" ]]; then
+    die "Tracked GameCube overlay missing: $DOLPHIN_OVERLAY"
+fi
+
+mkdir -p \
+    "$BAREFRONT_DIR/bios/gamecube/EUR" \
+    "$BAREFRONT_DIR/bios/gamecube/USA" \
+    "$BAREFRONT_DIR/bios/gamecube/JAP" \
+    "$DOLPHIN_USER_DIR/Config" \
+    "$DOLPHIN_USER_DIR/GC/EUR" \
+    "$DOLPHIN_USER_DIR/GC/USA" \
+    "$DOLPHIN_USER_DIR/GC/JAP"
+
+for REGION in EUR USA JAP; do
+    IPL_LINK="$DOLPHIN_USER_DIR/GC/$REGION/IPL.bin"
+    EXPECTED_TARGET="../../../../../bios/gamecube/$REGION/IPL.bin"
+
+    if [[ -L "$IPL_LINK" ]]; then
+        if [[ "$(readlink "$IPL_LINK")" != "$EXPECTED_TARGET" ]]; then
+            die "Unexpected Dolphin $REGION IPL link: $IPL_LINK"
+        fi
+    elif [[ -e "$IPL_LINK" ]]; then
+        die "Unmanaged Dolphin $REGION IPL path exists: $IPL_LINK"
+    else
+        ln -s "$EXPECTED_TARGET" "$IPL_LINK"
+    fi
+done
+
+
+# BareFront Dolphin Xbox controller baseline
+#
+# Fresh installs receive the live-tested Xbox Series X mapping.
+#
+# Existing configs are deliberately preserved unless they match
+# the exact legacy Dolphin keyboard/pointer default previously
+# created on BareFront.
+#
+# Xbox Guide is deliberately absent: Guide belongs to BareFront.
+
+if [[ ! -s "$DOLPHIN_GCPAD_BASELINE" ]]; then
+    die "Dolphin controller baseline missing: $DOLPHIN_GCPAD_BASELINE"
+fi
+
+DOLPHIN_GCPAD_BASELINE_SHA="$(
+    sha256sum "$DOLPHIN_GCPAD_BASELINE" |
+        awk '{print $1}'
+)"
+
+if [[ "$DOLPHIN_GCPAD_BASELINE_SHA" != "f80deb6cc14be94596416588e2832ac27ea14ee52e557f5d602a46e461fd3071" ]]; then
+    die "Unexpected Dolphin controller baseline."
+fi
+
+DOLPHIN_GCPAD_LEGACY_DEFAULT_SHA="f9dd132d66bef1f658237fcca72d927a2d815c61f69666ddd36abdb6a2ce48a0"
+
+if [[ ! -e "$DOLPHIN_GCPAD" ]]; then
+    install -m 0644 \
+        "$DOLPHIN_GCPAD_BASELINE" \
+        "$DOLPHIN_GCPAD"
+
+    echo "  Xbox controller mapping: CREATED"
+
+elif [[ -f "$DOLPHIN_GCPAD" ]]; then
+    DOLPHIN_GCPAD_SHA="$(
+        sha256sum "$DOLPHIN_GCPAD" |
+            awk '{print $1}'
+    )"
+
+    if [[ "$DOLPHIN_GCPAD_SHA" == "$DOLPHIN_GCPAD_BASELINE_SHA" ]]; then
+        echo "  Xbox controller mapping: CURRENT"
+
+    elif [[ "$DOLPHIN_GCPAD_SHA" == "$DOLPHIN_GCPAD_LEGACY_DEFAULT_SHA" ]]; then
+        install -m 0644 \
+            "$DOLPHIN_GCPAD_BASELINE" \
+            "$DOLPHIN_GCPAD"
+
+        echo "  Xbox controller mapping: UPGRADED"
+
+    else
+        echo "  Xbox controller mapping: PRESERVE CUSTOM"
+    fi
+
+else
+    echo "  Xbox controller mapping: PRESERVE NON-REGULAR PATH"
+fi
+
+# End BareFront Dolphin Xbox controller baseline
+
+
+if [[ ! -f "$DOLPHIN_GUIDE_SOURCE" ]]; then
+    die "Dolphin Guide helper source missing: $DOLPHIN_GUIDE_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+    die "g++ is required for the Dolphin Guide helper."
+fi
+
+if ! pkg-config --exists sdl2 x11 xtst; then
+    die "Dolphin Guide helper build dependencies are missing."
+fi
+
+DOLPHIN_GUIDE_DIR="$(dirname "$DOLPHIN_GUIDE_HELPER")"
+mkdir -p "$DOLPHIN_GUIDE_DIR"
+
+if [[ ! -x "$DOLPHIN_GUIDE_HELPER" ]] ||
+   [[ "$DOLPHIN_GUIDE_SOURCE" -nt "$DOLPHIN_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building Dolphin Xbox Guide helper..."
+
+    DOLPHIN_GUIDE_TEMP="$(
+        mktemp "$DOLPHIN_GUIDE_DIR/.dolphin-guide.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$DOLPHIN_GUIDE_SOURCE" \
+        -o "$DOLPHIN_GUIDE_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$DOLPHIN_GUIDE_TEMP"
+        die "Dolphin Guide helper compilation failed."
+    fi
+
+    chmod 0755 "$DOLPHIN_GUIDE_TEMP"
+    mv -f -- "$DOLPHIN_GUIDE_TEMP" "$DOLPHIN_GUIDE_HELPER"
+
+    echo "Dolphin Xbox Guide helper built."
+else
+    echo "Dolphin Xbox Guide helper already built."
+fi
+
+if [[ ! -x "$DOLPHIN_GUIDE_HELPER" ]]; then
+    die "Dolphin Guide helper verification failed."
+fi
+
+echo "Verifying Dolphin integration..."
+echo "  System executable: OK"
+echo "  Gamescope: OK"
+echo "  BareFront launcher: OK"
+echo "  Presentation overlay: OK"
+echo "  Xbox Guide helper: OK"
+echo "  IPL links: OK"
+echo
+echo "Dolphin integration stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed emulators
+# Part 6: bsnes v115
+# ============================================================
+
+heading "STAGE 3B / BSNES"
+
+BSNES_DIR="$BAREFRONT_DIR/emulators/bsnes"
+BSNES_EXE="$BSNES_DIR/bsnes"
+BSNES_LAUNCHER="$BAREFRONT_DIR/scripts/launch_bsnes.sh"
+BSNES_CONTROL_SOURCE="$BAREFRONT_DIR/src/snes_controller_helper.cpp"
+BSNES_CONTROL_HELPER="$BSNES_DIR/snes_controller_helper"
+
+# v115 is the final official stable bsnes release from Near/byuu.
+# Official stable Linux binaries are not provided in a form we
+# want to depend on, so BareFront builds the tagged stable source.
+BSNES_VERSION="v115"
+BSNES_SOURCE_URL="https://github.com/bsnes-emu/bsnes/archive/refs/tags/v115.tar.gz"
+
+echo "BareFront uses bsnes for:"
+echo "  Super NES"
+echo
+echo "Stable source release:"
+echo "  $BSNES_VERSION"
+echo
+echo "Install location:"
+echo "  $BSNES_DIR"
+echo
+
+
+if [[ -x "$BSNES_EXE" ]]; then
+
+    echo "bsnes is already installed."
+    echo "Executable:"
+    echo "  $BSNES_EXE"
+    echo "Action: SKIP"
+
+else
+
+    # --------------------------------------------------------
+    # Build dependencies
+    # --------------------------------------------------------
+
+    echo "Installing/verifying bsnes build dependencies..."
+    echo
+
+    BSNES_BUILD_PACKAGES=(
+        libgtk-3-dev
+        libgtksourceview-3.0-dev
+        libsdl2-dev
+        libxv-dev
+        libgl1-mesa-dev
+        libasound2-dev
+        libopenal-dev
+        libpulse-dev
+        libao-dev
+        libudev-dev
+        libxrandr-dev
+        libxext-dev
+    )
+
+    if ! sudo apt-get install -y "${BSNES_BUILD_PACKAGES[@]}"; then
+        die "Could not install bsnes build dependencies."
+    fi
+
+
+    # --------------------------------------------------------
+    # Temporary build workspace
+    # --------------------------------------------------------
+
+    TEMP_DIR="$(mktemp -d)"
+    SOURCE_ARCHIVE="$TEMP_DIR/bsnes-v115.tar.gz"
+    SOURCE_ROOT="$TEMP_DIR/source"
+
+    mkdir -p "$SOURCE_ROOT"
+
+    echo
+    echo "Downloading official bsnes v115 source..."
+
+    if ! curl -fL --progress-bar \
+        "$BSNES_SOURCE_URL" \
+        -o "$SOURCE_ARCHIVE"
+    then
+        rm -rf "$TEMP_DIR"
+        die "bsnes v115 source download failed."
+    fi
+
+    echo
+    echo "Downloaded archive:"
+    echo "  $(file -b "$SOURCE_ARCHIVE")"
+
+
+    # --------------------------------------------------------
+    # Extract source
+    # --------------------------------------------------------
+
+    echo
+    echo "Extracting bsnes source..."
+
+    if ! tar -xzf "$SOURCE_ARCHIVE" -C "$SOURCE_ROOT"; then
+        rm -rf "$TEMP_DIR"
+        die "bsnes source extraction failed."
+    fi
+
+    BSNES_SOURCE_DIR="$(
+        find "$SOURCE_ROOT" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'bsnes-*' \
+            -print \
+            -quit
+    )"
+
+    if [[ -z "$BSNES_SOURCE_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "Could not locate the extracted bsnes source directory."
+    fi
+
+    echo "Source directory:"
+    echo "  $BSNES_SOURCE_DIR"
+
+
+    # --------------------------------------------------------
+    # Debian 13 / modern GCC compatibility patch
+    #
+    # v115 uses std::runtime_error in natural.hpp but does not
+    # explicitly include <stdexcept>. Modern GCC correctly
+    # requires that header.
+    #
+    # The patch is tiny and applied only if it is not already
+    # present.
+    # --------------------------------------------------------
+
+    NATURAL_HPP="$BSNES_SOURCE_DIR/nall/arithmetic/natural.hpp"
+
+    if [[ ! -f "$NATURAL_HPP" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "Expected bsnes source file natural.hpp is missing."
+    fi
+
+    if grep -q '^#include <stdexcept>' "$NATURAL_HPP"; then
+
+        echo
+        echo "Modern-GCC compatibility include already present."
+
+    else
+
+        echo
+        echo "Applying Debian 13 / modern-GCC compatibility patch..."
+        echo "  Adding: #include <stdexcept>"
+
+        # sed -i edits the file in place.
+        #
+        # 1i means:
+        #   at line 1, INSERT the following text.
+        sed -i '1i#include <stdexcept>' "$NATURAL_HPP"
+
+    fi
+
+
+    # --------------------------------------------------------
+    # BareFront pseudo-fullscreen startup patch
+    #
+    # bsnes v115's normal --fullscreen path creates a separate
+    # override-redirect X11 video surface. Inside Gamescope that
+    # competes with the managed Hiro presentation window.
+    #
+    # BareFront adds --pseudo-fullscreen, using bsnes' existing
+    # managed-window pseudo-fullscreen path instead.
+    # --------------------------------------------------------
+
+    BSNES_MAIN_CPP="$BSNES_SOURCE_DIR/bsnes/target-bsnes/bsnes.cpp"
+    BSNES_PROGRAM_HPP="$BSNES_SOURCE_DIR/bsnes/target-bsnes/program/program.hpp"
+    BSNES_PROGRAM_CPP="$BSNES_SOURCE_DIR/bsnes/target-bsnes/program/program.cpp"
+
+    for required_file in \
+        "$BSNES_MAIN_CPP" \
+        "$BSNES_PROGRAM_HPP" \
+        "$BSNES_PROGRAM_CPP"
+    do
+        if [[ ! -f "$required_file" ]]; then
+            rm -rf "$TEMP_DIR"
+            die "Expected bsnes source file is missing: $required_file"
+        fi
+    done
+
+    echo
+    echo "Applying BareFront bsnes pseudo-fullscreen patch..."
+
+    python3 - \
+        "$BSNES_MAIN_CPP" \
+        "$BSNES_PROGRAM_HPP" \
+        "$BSNES_PROGRAM_CPP" \
+        <<'PYBSNESPSEUDO'
+from pathlib import Path
+import sys
+
+main_cpp = Path(sys.argv[1])
+program_hpp = Path(sys.argv[2])
+program_cpp = Path(sys.argv[3])
+
+def replace_once(path, old, new):
+    text = path.read_text()
+
+    if new in text:
+        return
+
+    if old not in text:
+        raise SystemExit(
+            f"Expected bsnes v115 source text was not found in {path}"
+        )
+
+    path.write_text(text.replace(old, new, 1))
+
+replace_once(
+    main_cpp,
+    '''    if(argument == "--fullscreen") {
+      program.startFullScreen = true;
+''',
+    '''    if(argument == "--fullscreen") {
+      program.startFullScreen = true;
+    } else if(argument == "--pseudo-fullscreen") {
+      program.startPseudoFullScreen = true;
+'''
+)
+
+replace_once(
+    program_hpp,
+    '''  bool startFullScreen = false;
+''',
+    '''  bool startFullScreen = false;
+  bool startPseudoFullScreen = false;
+'''
+)
+
+replace_once(
+    program_cpp,
+    '''  if(startFullScreen && emulator->loaded()) {
+    toggleVideoFullScreen();
+  }
+  Application::onMain({&Program::main, this});
+''',
+    '''  if(startFullScreen && emulator->loaded()) {
+    toggleVideoFullScreen();
+  }
+  if(startPseudoFullScreen && emulator->loaded()) {
+    toggleVideoPseudoFullScreen();
+  }
+  Application::onMain({&Program::main, this});
+'''
+)
+
+print("BareFront pseudo-fullscreen patch applied.")
+PYBSNESPSEUDO
+
+
+    # --------------------------------------------------------
+    # Compile
+    #
+    # make tells GNU Make to follow the project's build rules.
+    #
+    # -C bsnes
+    #   changes into the source's bsnes directory before building.
+    #
+    # hiro=gtk3
+    #   builds the Linux GTK3 graphical interface.
+    #
+    # local=false
+    #   IMPORTANT: do not optimise the binary only for the CPU
+    #   currently doing the build. This makes the resulting
+    #   BareFront bsnes binary more portable to other amd64 PCs.
+    #
+    # -j"$(nproc)"
+    #   compile several files in parallel. `nproc` asks Linux how
+    #   many CPU processing units are available.
+    # --------------------------------------------------------
+
+    echo
+    echo "Building bsnes $BSNES_VERSION..."
+    echo
+    echo "Build command:"
+    echo '  make -C bsnes hiro=gtk3 local=false -j"$(nproc)"'
+    echo
+
+    if ! make \
+        -C "$BSNES_SOURCE_DIR/bsnes" \
+        hiro=gtk3 \
+        local=false \
+        -j"$(nproc)"
+    then
+        rm -rf "$TEMP_DIR"
+        die "bsnes compilation failed."
+    fi
+
+
+    BUILT_BSNES="$BSNES_SOURCE_DIR/bsnes/out/bsnes"
+
+    if [[ ! -x "$BUILT_BSNES" ]]; then
+        rm -rf "$TEMP_DIR"
+        die "bsnes build completed but the expected executable was not produced."
+    fi
+
+
+    # --------------------------------------------------------
+    # Install the finished build
+    # --------------------------------------------------------
+
+    mkdir -p "$BSNES_DIR"
+
+    cp "$BUILT_BSNES" "$BSNES_EXE"
+    chmod +x "$BSNES_EXE"
+
+    # Keep the stable release database beside the executable
+    # when it is present in the source tree.
+    if [[ -d "$BSNES_SOURCE_DIR/bsnes/Database" ]]; then
+        rm -rf "$BSNES_DIR/Database"
+        cp -a \
+            "$BSNES_SOURCE_DIR/bsnes/Database" \
+            "$BSNES_DIR/Database"
+    fi
+
+    cat > "$BSNES_DIR/VERSION.txt" <<EOF
+BareFront managed emulator
+Emulator: bsnes
+Release: v115
+Source: https://github.com/bsnes-emu/bsnes
+Build UI: GTK3
+CPU-specific optimisation: disabled (local=false)
+BareFront Debian 13 compatibility patch:
+  nall/arithmetic/natural.hpp includes <stdexcept>
+EOF
+
+    rm -rf "$TEMP_DIR"
+
+    echo
+    echo "bsnes v115 built and installed."
+fi
+
+
+# ------------------------------------------------------------
+# Final verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying bsnes..."
+
+if [[ -x "$BSNES_EXE" ]]; then
+
+    echo "  Executable: OK"
+    echo "  $BSNES_EXE"
+
+else
+
+    die "bsnes installation verification failed."
+
+fi
+
+if [[ -d "$BSNES_DIR/Database" ]]; then
+    echo "  Database: OK"
+else
+    echo "  Database: not present"
+    echo "  This is not treated as a fatal installer error."
+fi
+
+if ! command -v pactl >/dev/null 2>&1; then
+    die "SNES HDMI sink routing requires pactl."
+fi
+
+# ------------------------------------------------------------
+# BareFront bsnes baseline
+#
+# BareFront owns the settings required to provide a clean,
+# predictable SNES presentation:
+#   - raw, unfiltered 256x224 emulator output
+#   - neutral colour/gamma handling
+#   - stable PulseAudio routed to BareFront-selected HDMI
+#   - no bsnes status bar
+#   - Esc exits directly to BareFront
+#   - saves/states remain under BareFront
+#
+# Unrelated bsnes settings are preserved.
+# ------------------------------------------------------------
+
+BSNES_CONFIG_DIR="$HOME/.config/bsnes"
+BSNES_CONFIG="$BSNES_CONFIG_DIR/settings.bml"
+BSNES_SAVE_DIR="$BAREFRONT_DIR/saves/snes"
+BSNES_STATE_DIR="$BSNES_SAVE_DIR/states"
+
+mkdir -p \
+    "$BSNES_CONFIG_DIR" \
+    "$BSNES_SAVE_DIR" \
+    "$BSNES_STATE_DIR"
+
+echo
+echo "Creating/verifying BareFront bsnes baseline..."
+
+if [[ -f "$BSNES_CONFIG" ]]; then
+    echo "Existing bsnes user configuration found."
+    echo "Preserving unrelated emulator settings."
+    BSNES_CONFIG_ACTION="REPAIR BAREFRONT INTEGRATION"
+else
+    echo "No existing bsnes configuration found."
+    BSNES_CONFIG_ACTION="CREATE BASELINE"
+fi
+
+python3 - \
+    "$BSNES_CONFIG" \
+    "$BSNES_SAVE_DIR" \
+    "$BSNES_STATE_DIR" \
+    <<'PYBSNESCONFIG'
+from pathlib import Path
+import sys
+
+config = Path(sys.argv[1])
+save_dir = sys.argv[2]
+state_dir = sys.argv[3]
+
+if config.exists():
+    lines = config.read_text().splitlines()
+else:
+    lines = []
+
+
+def ensure(section, key, value):
+    global lines
+
+    try:
+        section_index = lines.index(section)
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append(section)
+        section_index = len(lines) - 1
+
+    section_end = len(lines)
+
+    for i in range(section_index + 1, len(lines)):
+        line = lines[i]
+
+        if line and not line[0].isspace():
+            section_end = i
+            break
+
+    prefix = f"  {key}:"
+
+    for i in range(section_index + 1, section_end):
+        if lines[i].startswith(prefix):
+            lines[i] = f"  {key}: {value}"
+            return
+
+    lines.insert(section_end, f"  {key}: {value}")
+
+
+def seed_barefront_gamepad():
+    global lines
+
+    # Portable bsnes v115 keyboard bindings proven on BareFront.
+    # The SDL controller helper translates normalized controller
+    # input to these keys, avoiding host-specific joypad IDs.
+    mapping = {
+        "Up":     "0x1/0/84",
+        "Down":   "0x1/0/85",
+        "Left":   "0x1/0/86",
+        "Right":  "0x1/0/87",
+        "B":      "0x1/0/60",
+        "A":      "0x1/0/58",
+        "Y":      "0x1/0/35",
+        "X":      "0x1/0/53",
+        "L":      "0x1/0/51",
+        "R":      "0x1/0/57",
+        "Select": "0x1/0/88",
+        "Start":  "0x1/0/89",
+    }
+
+    # Previous BareFront baseline. These values contain the
+    # host-specific bsnes joypad identity and are safe to migrate.
+    legacy_mapping = {
+        "Up":     "0x45e0b12/1/1/Lo",
+        "Down":   "0x45e0b12/1/1/Hi",
+        "Left":   "0x45e0b12/1/0/Lo",
+        "Right":  "0x45e0b12/1/0/Hi",
+        "B":      "0x45e0b12/3/0",
+        "A":      "0x45e0b12/3/1",
+        "Y":      "0x45e0b12/3/2",
+        "X":      "0x45e0b12/3/3",
+        "L":      "0x45e0b12/3/4",
+        "R":      "0x45e0b12/3/5",
+        "Select": "0x45e0b12/3/6",
+        "Start":  "0x45e0b12/3/7",
+    }
+
+    def mapped_gamepad_lines():
+        result = [
+            "  ControllerPort1: Gamepad",
+            "    Gamepad",
+        ]
+
+        for key, value in mapping.items():
+            result.append(f"      {key}: {value}")
+
+        return result
+
+    # Fresh configuration: create the native structure and
+    # BareFront portable keyboard baseline.
+    try:
+        system_index = lines.index("SuperFamicom")
+    except ValueError:
+        if lines and lines[-1] != "":
+            lines.append("")
+
+        lines.append("SuperFamicom")
+        lines.extend(mapped_gamepad_lines())
+        return
+
+    system_end = len(lines)
+
+    for i in range(system_index + 1, len(lines)):
+        line = lines[i]
+
+        if line and not line[0].isspace():
+            system_end = i
+            break
+
+    # Existing SuperFamicom section but no Port 1.
+    port_index = None
+
+    for i in range(system_index + 1, system_end):
+        if lines[i] == "  ControllerPort1: Gamepad":
+            port_index = i
+            break
+
+    if port_index is None:
+        lines[system_end:system_end] = mapped_gamepad_lines()
+        return
+
+    port_end = system_end
+
+    for i in range(port_index + 1, system_end):
+        line = lines[i]
+
+        if not line:
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        if indent <= 2:
+            port_end = i
+            break
+
+    # Existing Port 1 but no Gamepad subsection.
+    gamepad_index = None
+
+    for i in range(port_index + 1, port_end):
+        if lines[i] == "    Gamepad":
+            gamepad_index = i
+            break
+
+    if gamepad_index is None:
+        block = ["    Gamepad"]
+
+        for key, value in mapping.items():
+            block.append(f"      {key}: {value}")
+
+        lines[port_end:port_end] = block
+        return
+
+    gamepad_end = port_end
+
+    for i in range(gamepad_index + 1, port_end):
+        line = lines[i]
+
+        if not line:
+            continue
+
+        indent = len(line) - len(line.lstrip())
+
+        if indent <= 4:
+            gamepad_end = i
+            break
+
+    control_lines = {}
+
+    for i in range(gamepad_index + 1, gamepad_end):
+        line = lines[i]
+
+        if not line.startswith("      "):
+            continue
+
+        stripped = line.strip()
+
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+            value = value.strip()
+        else:
+            key = stripped
+            value = ""
+
+        if key in mapping:
+            control_lines[key] = (i, value)
+
+    # Unexpected/incomplete layouts may be user-created.
+    if set(control_lines) != set(mapping):
+        return
+
+    # Only values BareFront itself knows are safe to migrate:
+    # empty, previous host-specific baseline, or current portable baseline.
+    for key, (_, value) in control_lines.items():
+        known_values = {
+            "",
+            legacy_mapping[key],
+            mapping[key],
+        }
+
+        if value not in known_values:
+            return
+
+    # Complete known BareFront/empty mapping: normalize all controls
+    # to the current portable keyboard baseline.
+    for key, value in mapping.items():
+        i, _ = control_lines[key]
+        lines[i] = f"      {key}: {value}"
+
+
+seed_barefront_gamepad()
+
+
+ensure("Path", "Saves", f"{save_dir}/")
+ensure("Path", "States", f"{state_dir}/")
+
+ensure("Hotkey", "QuitEmulator", "0x1/0/0")
+
+ensure("Video", "Driver", "XShm")
+ensure("Video", "Shader", "None")
+ensure("Video", "Output", "Scale")
+ensure("Video", "Multiplier", "1")
+ensure("Video", "AspectCorrection", "false")
+ensure("Video", "Overscan", "false")
+ensure("Video", "Blur", "false")
+ensure("Video", "Filter", "None")
+ensure("Video", "Luminance", "100")
+ensure("Video", "Saturation", "100")
+ensure("Video", "Gamma", "100")
+ensure("Video", "Dimming", "false")
+
+ensure("Audio", "Driver", "PulseAudio")
+ensure("Audio", "Device", "Default")
+ensure("Audio", "Blocking", "true")
+ensure("Audio", "Frequency", "48000")
+ensure("Audio", "Latency", "40")
+
+ensure("General", "StatusBar", "false")
+
+config.write_text("\n".join(lines) + "\n")
+PYBSNESCONFIG
+
+echo
+echo "BareFront bsnes integration:"
+echo "  Video: raw / unfiltered"
+echo "  Gamma: 100"
+echo "  Dimming: false"
+echo "  Audio: PulseAudio -> BareFront-selected HDMI / 48 kHz / 40 ms"
+echo "  Status bar: disabled"
+echo "  Esc: exit directly to BareFront"
+echo "  SRAM saves: $BSNES_SAVE_DIR/"
+echo "  Save states: $BSNES_STATE_DIR/"
+echo "  Action: $BSNES_CONFIG_ACTION"
+
+echo
+echo "No SNES BIOS is required for ordinary cartridge games."
+echo
+echo "BareFront launch command will later use:"
+echo "  $BSNES_LAUNCHER {rom}"
+
+# ------------------------------------------------------------
+# SNES Xbox Guide hold helper
+# ------------------------------------------------------------
+
+echo
+echo "Installing/verifying SNES controller helper..."
+
+if [[ ! -f "$BSNES_CONTROL_SOURCE" ]]; then
+    die "SNES controller helper source is missing."
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    echo
+    echo "Installing SNES controller helper build dependencies..."
+
+    if ! sudo apt-get install -y \
+        g++ \
+        pkg-config \
+        libsdl2-dev \
+        libx11-dev \
+        libxtst-dev
+    then
+        die "Could not install SNES controller helper build dependencies."
+    fi
+fi
+
+if [[ ! -x "$BSNES_CONTROL_HELPER" ]] ||
+   [[ "$BSNES_CONTROL_SOURCE" -nt "$BSNES_CONTROL_HELPER" ]]
+then
+    echo
+    echo "Building SNES controller helper..."
+
+    BSNES_CONTROL_CANDIDATE="$(
+        mktemp "$BSNES_DIR/.snes-controller-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$BSNES_CONTROL_SOURCE" \
+        -o "$BSNES_CONTROL_CANDIDATE" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$BSNES_CONTROL_CANDIDATE"
+        die "SNES controller helper compilation failed."
+    fi
+
+    chmod 755 "$BSNES_CONTROL_CANDIDATE"
+    mv -fT \
+        "$BSNES_CONTROL_CANDIDATE" \
+        "$BSNES_CONTROL_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo "SNES controller helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$BSNES_CONTROL_HELPER" ]]; then
+    die "SNES controller helper verification failed."
+fi
+
+echo "  SNES controller helper: OK"
+echo
+echo "bsnes stage complete."
+
+
+# ============================================================
+# Stage 3B - Locally managed integration
+# Part 7: Amiberry
+# ============================================================
+
+heading "STAGE 3B / AMIBERRY"
+
+AMIBERRY_EXE="/usr/bin/amiberry"
+AMIBERRY_LOCAL_DIR="$BAREFRONT_DIR/emulators/amiberry"
+AMIBERRY_CONF="$AMIBERRY_LOCAL_DIR/amiberry.conf"
+AMIBERRY_LAUNCHER="$BAREFRONT_DIR/scripts/launch_amiberry.sh"
+AMIBERRY_ESC_SOURCE="$BAREFRONT_DIR/src/amiberry_esc_helper.cpp"
+AMIBERRY_ESC_HELPER="$AMIBERRY_LOCAL_DIR/amiberry_esc_helper"
+AMIBERRY_PROFILE="$BAREFRONT_DIR/saves/amiga/amiberry"
+AMIBERRY_WHD_SOURCE="/usr/share/amiberry/whdboot"
+AMIBERRY_WHD_BOOT="$AMIBERRY_PROFILE/xdg-data/amiberry/WHDBoot"
+
+echo "BareFront uses Amiberry for:"
+echo "  Amiga"
+echo
+echo "Amiberry installation method:"
+echo "  Official Amiberry Debian package repository"
+echo
+echo "Expected executable:"
+echo "  $AMIBERRY_EXE"
+echo
+
+
+# ------------------------------------------------------------
+# Install Amiberry from the official package repository
+# ------------------------------------------------------------
+
+if package_is_installed "amiberry" && [[ -x "$AMIBERRY_EXE" ]]; then
+
+    echo "Amiberry is already installed."
+    echo "Action: SKIP package installation."
+
+else
+
+    # First ask APT whether an Amiberry package is already visible.
+    AMIBERRY_CANDIDATE="$(
+        apt-cache policy amiberry 2>/dev/null \
+        | awk '/Candidate:/ {print $2}'
+    )"
+
+    if [[ -z "$AMIBERRY_CANDIDATE" || "$AMIBERRY_CANDIDATE" == "(none)" ]]; then
+
+        echo
+        echo "Amiberry is not currently visible to Debian APT."
+        echo
+        echo "The Amiberry project recommends its official package"
+        echo "repository for Debian 13."
+        echo
+        echo "BareFront can add that repository using the official"
+        echo "Amiberry repository setup script from:"
+        echo
+        echo "  https://packages.amiberry.com/install.sh"
+        echo
+        echo "This will add Amiberry's package source/signing setup"
+        echo "to Debian. It does NOT install ROMs or Kickstart files."
+        echo
+
+        read -r -p "Add the official Amiberry repository? [Y/n] " reply
+        reply="${reply:-Y}"
+
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            die "Amiberry repository setup was declined."
+        fi
+
+        TEMP_DIR="$(mktemp -d)"
+        AMIBERRY_REPO_SCRIPT="$TEMP_DIR/amiberry-install.sh"
+
+        echo
+        echo "Downloading the official Amiberry repository setup script..."
+
+        # We deliberately download the script FIRST and run the saved
+        # file afterwards. This is clearer than piping web content
+        # directly into a root shell.
+        if ! curl -fsSL \
+            "https://packages.amiberry.com/install.sh" \
+            -o "$AMIBERRY_REPO_SCRIPT"
+        then
+            rm -rf "$TEMP_DIR"
+            die "Could not download Amiberry's repository setup script."
+        fi
+
+        echo "Downloaded:"
+        echo "  $AMIBERRY_REPO_SCRIPT"
+        echo
+        echo "Running the official repository setup..."
+
+        if ! sudo sh "$AMIBERRY_REPO_SCRIPT"; then
+            rm -rf "$TEMP_DIR"
+            die "Amiberry repository setup failed."
+        fi
+
+        rm -rf "$TEMP_DIR"
+
+        echo
+        echo "Refreshing Debian package catalogue..."
+
+        if ! sudo apt-get update; then
+            die "APT refresh failed after adding the Amiberry repository."
+        fi
+    fi
+
+
+    echo
+    echo "Installing Amiberry..."
+
+    if ! sudo apt-get install -y amiberry; then
+        die "Amiberry package installation failed."
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Verify installed package
+# ------------------------------------------------------------
+
+echo
+echo "Verifying Amiberry package..."
+
+if [[ ! -x "$AMIBERRY_EXE" ]]; then
+    die "Amiberry package was installed but /usr/bin/amiberry is missing."
+fi
+
+AMIBERRY_PACKAGE_VERSION="$(
+    dpkg-query -W -f='${Version}' amiberry 2>/dev/null || true
+)"
+
+echo "  Executable: OK"
+echo "  $AMIBERRY_EXE"
+echo
+echo "Installed package version:"
+echo "  ${AMIBERRY_PACKAGE_VERSION:-Unknown}"
+
+
+# ------------------------------------------------------------
+# BareFront-owned Amiga directories
+# ------------------------------------------------------------
+
+mkdir -p \
+    "$AMIBERRY_LOCAL_DIR" \
+    "$AMIBERRY_LOCAL_DIR/conf" \
+    "$AMIBERRY_PROFILE/home" \
+    "$AMIBERRY_PROFILE/xdg-config" \
+    "$AMIBERRY_PROFILE/xdg-data" \
+    "$AMIBERRY_WHD_BOOT" \
+    "$BAREFRONT_DIR/roms/amiga" \
+    "$BAREFRONT_DIR/bios/amiga" \
+    "$BAREFRONT_DIR/saves/amiga/savestates" \
+    "$BAREFRONT_DIR/saves/amiga/nvram" \
+    "$BAREFRONT_DIR/saves/amiga/saveimages" \
+    "$BAREFRONT_DIR/assets/games/amiga"
+
+
+# ------------------------------------------------------------
+# Seed Amiberry's WHDLoad Booter runtime
+#
+# The Debian package provides the runtime files. Copy only files
+# which are not already present so reinstalling BareFront cannot
+# overwrite WHDLoad saves or a database updated by the user.
+# ------------------------------------------------------------
+
+if [[ ! -d "$AMIBERRY_WHD_SOURCE" ]]; then
+    die "Amiberry WHDLoad runtime not found: $AMIBERRY_WHD_SOURCE"
+fi
+
+echo
+echo "Seeding BareFront WHDLoad runtime..."
+
+cp -a --no-clobber \
+    "$AMIBERRY_WHD_SOURCE/." \
+    "$AMIBERRY_WHD_BOOT/"
+
+AMIBERRY_WHD_REQUIRED=(
+    AmiQuit
+    boot-data.zip
+    game-data/whdload_db.json
+    JST
+    WHDLoad
+)
+
+for REQUIRED_FILE in "${AMIBERRY_WHD_REQUIRED[@]}"; do
+    if [[ ! -f "$AMIBERRY_WHD_BOOT/$REQUIRED_FILE" ]]; then
+        die "Missing WHDLoad runtime file: $REQUIRED_FILE"
+    fi
+done
+
+echo "  WHDLoad runtime: OK"
+
+
+# ------------------------------------------------------------
+# Build the BareFront Amiberry Escape helper
+#
+# It watches the raw XInput2 keyboard stream so Esc still works
+# while Amiberry owns keyboard focus, then requests a clean exit
+# through Amiberry's Unix-domain IPC socket.
+# ------------------------------------------------------------
+
+if [[ ! -f "$AMIBERRY_ESC_SOURCE" ]]; then
+    die "Amiberry Escape helper source missing: $AMIBERRY_ESC_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+    die "g++ is required for the Amiberry Escape/Guide helper."
+fi
+
+if ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xi xtst
+then
+    die "Amiberry Escape/Guide helper build dependencies are missing."
+fi
+
+if [[ ! -x "$AMIBERRY_ESC_HELPER" ]] ||
+   [[ "$AMIBERRY_ESC_SOURCE" -nt "$AMIBERRY_ESC_HELPER" ]]
+then
+    echo
+    echo "Building BareFront Amiberry Escape/Guide helper..."
+
+    AMIBERRY_ESC_TEMP="$(
+        mktemp "$AMIBERRY_LOCAL_DIR/.amiberry-esc-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra -pedantic \
+        "$AMIBERRY_ESC_SOURCE" \
+        -o "$AMIBERRY_ESC_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xi xtst)
+    then
+        rm -f -- "$AMIBERRY_ESC_TEMP"
+        die "Could not build the Amiberry Escape/Guide helper."
+    fi
+
+    chmod 0755 "$AMIBERRY_ESC_TEMP"
+    mv -fT -- "$AMIBERRY_ESC_TEMP" "$AMIBERRY_ESC_HELPER"
+
+    echo "  Action: BUILD"
+else
+    echo
+    echo "  Escape/Guide helper is already built and current."
+    echo "  Action: SKIP"
+fi
+
+if [[ ! -x "$AMIBERRY_ESC_HELPER" ]]; then
+    die "Amiberry Escape helper verification failed."
+fi
+
+
+# ------------------------------------------------------------
+# Generate BareFront's Amiberry global configuration
+#
+# Amiberry normally spreads its content between ~/Amiberry,
+# ~/.config/amiberry and ~/.local/share/amiberry.
+#
+# For a BareFront appliance we instead use a dedicated config
+# file and explicitly point the useful paths at our project.
+# ------------------------------------------------------------
+
+echo
+echo "Generating BareFront Amiberry path configuration..."
+
+cat > "$AMIBERRY_CONF" <<EOF
+# BareFront-managed Amiberry configuration
+#
+# Emulator-specific settings can still be changed inside Amiberry.
+# These entries only make BareFront's filesystem layout predictable.
+
+# BareFront presentation policy.
+#
+# Amiberry is responsible only for native Amiga emulation.
+# Gamescope owns scaling/presentation and BareCRT is external.
+#
+# WHDLoad may still choose the correct emulated hardware for
+# each title, but its JSON database must not override display
+# presentation settings.
+allow_display_settings_from_json=no
+default_line_mode=0
+default_scaling_method=0
+default_gfx_autoresolution=1
+default_auto_crop=no
+default_correct_aspect_ratio=no
+
+config_path=$AMIBERRY_LOCAL_DIR/conf
+rom_path=$BAREFRONT_DIR/bios/amiga
+
+# BareFront keeps all Amiga game media in the system ROM folder.
+whdload_arch_path=$BAREFRONT_DIR/roms/amiga
+floppy_path=$BAREFRONT_DIR/roms/amiga
+harddrive_path=$BAREFRONT_DIR/roms/amiga
+cdrom_path=$BAREFRONT_DIR/roms/amiga
+
+savestate_dir=$BAREFRONT_DIR/saves/amiga/savestates
+nvram_dir=$BAREFRONT_DIR/saves/amiga/nvram
+saveimage_dir=$BAREFRONT_DIR/saves/amiga/saveimages
+screenshot_dir=$BAREFRONT_DIR/assets/games/amiga
+
+logfile_path=$BAREFRONT_DIR/logs/amiberry.log
+EOF
+
+echo "  Configuration:"
+echo "  $AMIBERRY_CONF"
+
+
+# ------------------------------------------------------------
+# Verify the tracked BareFront launcher wrapper
+#
+# /usr/bin/amiberry is owned by Debian/APT and remains untouched.
+# The tracked wrapper supplies BareFront's isolated profile,
+# automatic media loading and clean Esc-to-IPC shutdown.
+# ------------------------------------------------------------
+
+echo
+echo "Verifying BareFront Amiberry launcher..."
+
+if [[ ! -f "$AMIBERRY_LAUNCHER" ]]; then
+    die "Tracked Amiberry launcher is missing: $AMIBERRY_LAUNCHER"
+fi
+
+chmod +x "$AMIBERRY_LAUNCHER"
+
+if [[ ! -x "$AMIBERRY_LAUNCHER" ]]; then
+    die "Amiberry launcher is not executable: $AMIBERRY_LAUNCHER"
+fi
+
+echo "  Launcher: OK"
+echo "  $AMIBERRY_LAUNCHER"
+
+
+# ------------------------------------------------------------
+# Verify Amiberry's resolved paths without launching the GUI.
+#
+# --dump-paths is an official diagnostic/dry-run command.
+# It prints the paths Amiberry resolved and exits.
+# ------------------------------------------------------------
+
+echo
+echo "Checking Amiberry resolved paths..."
+
+AMIBERRY_PATH_DUMP="$(
+    AMIBERRY_HOME_DIR="$AMIBERRY_PROFILE/home" \
+    XDG_CONFIG_HOME="$AMIBERRY_PROFILE/xdg-config" \
+    XDG_DATA_HOME="$AMIBERRY_PROFILE/xdg-data" \
+    "$AMIBERRY_EXE" \
+        -o "amiberry_config=$AMIBERRY_CONF" \
+        --dump-paths \
+        2>&1 || true
+)"
+
+printf '%s\n' "$AMIBERRY_PATH_DUMP" \
+    | sed 's/^/  /'
+
+AMIBERRY_EXPECTED_PATHS=(
+    "settings_dir=$AMIBERRY_PROFILE/xdg-config/amiberry"
+    "home_dir=$AMIBERRY_PROFILE/home"
+    "controllers_path=$AMIBERRY_PROFILE/xdg-data/amiberry/Controllers/"
+    "whdboot_path=$AMIBERRY_WHD_BOOT/"
+)
+
+for EXPECTED_PATH in "${AMIBERRY_EXPECTED_PATHS[@]}"; do
+    if ! grep -Fqx \
+        "$EXPECTED_PATH" \
+        <<< "$AMIBERRY_PATH_DUMP"
+    then
+        die "Amiberry path isolation failed: $EXPECTED_PATH"
+    fi
+done
+
+echo
+echo "  BareFront path isolation: OK"
+
+
+# ------------------------------------------------------------
+# Kickstart note
+# ------------------------------------------------------------
+
+echo
+echo "Amiga Kickstart ROMs belong in:"
+echo "  $BAREFRONT_DIR/bios/amiga/"
+echo
+echo "For encrypted/licensed Cloanto ROM sets, rom.key should be"
+echo "kept alongside the Kickstart ROMs."
+echo
+echo "BareFront will later verify known Kickstart files by:"
+echo "  filename / size / CRC32 / SHA-256"
+echo
+echo "Amiberry does not require one single Kickstart version for"
+echo "every game; the firmware checker will accept recognised"
+echo "compatible variants."
+
+
+# ------------------------------------------------------------
+# Install record
+# ------------------------------------------------------------
+
+cat > "$AMIBERRY_LOCAL_DIR/VERSION.txt" <<EOF
+BareFront managed emulator integration
+Emulator: Amiberry
+Package version: ${AMIBERRY_PACKAGE_VERSION:-Unknown}
+Executable: /usr/bin/amiberry
+Source: https://packages.amiberry.com/
+BareFront config: $AMIBERRY_CONF
+BareFront launcher: $AMIBERRY_LAUNCHER
+BareFront profile: $AMIBERRY_PROFILE
+WHDLoad runtime: $AMIBERRY_WHD_BOOT
+Escape helper: $AMIBERRY_ESC_HELPER
+EOF
+
+
+# ------------------------------------------------------------
+# Final verification
+# ------------------------------------------------------------
+
+echo
+echo "Verifying Amiberry integration..."
+
+if [[ -x "$AMIBERRY_EXE" ]]; then
+    echo "  System executable: OK"
+else
+    die "Amiberry executable verification failed."
+fi
+
+if [[ -f "$AMIBERRY_CONF" ]]; then
+    echo "  BareFront config: OK"
+else
+    die "Amiberry BareFront config was not created."
+fi
+
+if [[ -x "$AMIBERRY_LAUNCHER" ]]; then
+    echo "  BareFront launcher: OK"
+else
+    die "Amiberry BareFront launcher was not created."
+fi
+
+if [[ -x "$AMIBERRY_ESC_HELPER" ]]; then
+    echo "  Escape helper: OK"
+else
+    die "Amiberry Escape helper verification failed."
+fi
+
+if [[ -f "$AMIBERRY_WHD_BOOT/boot-data.zip" ]] &&
+   [[ -f "$AMIBERRY_WHD_BOOT/game-data/whdload_db.json" ]]
+then
+    echo "  WHDLoad runtime: OK"
+else
+    die "Amiberry WHDLoad runtime verification failed."
+fi
+
+echo
+echo "BareFront launch command will later use:"
+echo "  $AMIBERRY_LAUNCHER {rom}"
+echo
+echo "BareFront-owned controls:"
+echo "  Esc = return directly to BareFront"
+echo
+echo "Amiberry stage complete."
+
+
+# ============================================================
+# Stage 3B - PC Engine / Mednafen integration
+# ============================================================
+
+heading "STAGE 3B / PC ENGINE"
+
+MEDNAFEN_PCE_EXE="/usr/games/mednafen"
+MEDNAFEN_PCE_LOCAL_DIR="$BAREFRONT_DIR/emulators/mednafen"
+MEDNAFEN_PCE_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mednafen_pce.sh"
+MEDNAFEN_PCE_PROFILE="$BAREFRONT_DIR/saves/pcengine/mednafen"
+MEDNAFEN_PCE_CONFIG="$MEDNAFEN_PCE_PROFILE/mednafen.cfg"
+MEDNAFEN_PCE_CONTROL_SOURCE="$BAREFRONT_DIR/src/pcengine_controller_helper.cpp"
+MEDNAFEN_PCE_CONTROL_HELPER="$MEDNAFEN_PCE_LOCAL_DIR/pcengine_controller_helper"
+
+MEDNAFEN_PCE_BARECRT_DIR="$BAREFRONT_DIR/assets/shaders/barecrt"
+MEDNAFEN_PCE_BARECRT_SHADER="$MEDNAFEN_PCE_BARECRT_DIR/BareCRT_v2.fx"
+MEDNAFEN_PCE_RESHADE_INCLUDE="$MEDNAFEN_PCE_BARECRT_DIR/ReShade.fxh"
+MEDNAFEN_PCE_OVERLAY="$BAREFRONT_DIR/assets/overlays/pcengine.png"
+
+VKBASALT_LAYER="/usr/share/vulkan/implicit_layer.d/vkBasalt.json"
+
+echo "Configuring BareFront PC Engine integration..."
+echo
+
+if [[ ! -x "$MEDNAFEN_PCE_EXE" ]]; then
+    die "Mednafen executable not found: $MEDNAFEN_PCE_EXE"
+fi
+
+if [[ ! -f "$MEDNAFEN_PCE_LAUNCHER" ]]; then
+    die "Tracked PC Engine launcher missing: $MEDNAFEN_PCE_LAUNCHER"
+fi
+
+chmod +x "$MEDNAFEN_PCE_LAUNCHER"
+
+if [[ ! -x "$MEDNAFEN_PCE_LAUNCHER" ]]; then
+    die "PC Engine launcher is not executable."
+fi
+
+if ! command -v xrandr >/dev/null 2>&1; then
+    die "PC Engine presentation requires xrandr."
+fi
+
+if [[ ! -f "$VKBASALT_LAYER" ]]; then
+    die "vkBasalt Vulkan layer is missing: $VKBASALT_LAYER"
+fi
+
+if [[ ! -s "$MEDNAFEN_PCE_BARECRT_SHADER" ]]; then
+    die "BareCRT shader is missing: $MEDNAFEN_PCE_BARECRT_SHADER"
+fi
+
+if [[ ! -s "$MEDNAFEN_PCE_RESHADE_INCLUDE" ]]; then
+    die "BareCRT ReShade include is missing: $MEDNAFEN_PCE_RESHADE_INCLUDE"
+fi
+
+if [[ ! -s "$MEDNAFEN_PCE_OVERLAY" ]]; then
+    die "PC Engine overlay artwork is missing: $MEDNAFEN_PCE_OVERLAY"
+fi
+
+mkdir -p \
+    "$MEDNAFEN_PCE_LOCAL_DIR" \
+    "$MEDNAFEN_PCE_PROFILE" \
+    "$BAREFRONT_DIR/bios/pcengine" \
+    "$BAREFRONT_DIR/roms/pcengine" \
+    "$BAREFRONT_DIR/saves/pcengine" \
+    "$BAREFRONT_DIR/assets/games/pcengine" \
+    "$BAREFRONT_DIR/assets/videos/pcengine"
+
+# ------------------------------------------------------------
+# PC Engine BareFront controller helper
+# Guide tap = ignored
+# Guide hold 1.5 s = exit
+# ------------------------------------------------------------
+
+if [[ ! -f "$MEDNAFEN_PCE_CONTROL_SOURCE" ]]; then
+    die "PC Engine controller helper source is missing: $MEDNAFEN_PCE_CONTROL_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "PC Engine controller helper build dependencies are missing."
+fi
+
+if [[ ! -x "$MEDNAFEN_PCE_CONTROL_HELPER" ]] ||
+   [[ "$MEDNAFEN_PCE_CONTROL_SOURCE" -nt "$MEDNAFEN_PCE_CONTROL_HELPER" ]]
+then
+    echo
+    echo "Building PC Engine BareFront controller helper..."
+
+    MEDNAFEN_PCE_CONTROL_TEMP="$(
+        mktemp "$MEDNAFEN_PCE_LOCAL_DIR/.pcengine_controller_helper.XXXXXX"
+    )"
+
+    rm -f -- "$MEDNAFEN_PCE_CONTROL_TEMP"
+
+    if ! g++ \
+        -std=c++17 \
+        -Wall \
+        -Wextra \
+        -Wpedantic \
+        "$MEDNAFEN_PCE_CONTROL_SOURCE" \
+        -o "$MEDNAFEN_PCE_CONTROL_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$MEDNAFEN_PCE_CONTROL_TEMP"
+        die "PC Engine controller helper compilation failed."
+    fi
+
+    chmod 755 "$MEDNAFEN_PCE_CONTROL_TEMP"
+    mv -fT \
+        "$MEDNAFEN_PCE_CONTROL_TEMP" \
+        "$MEDNAFEN_PCE_CONTROL_HELPER"
+
+    echo "  Action: BUILD"
+else
+    echo
+    echo "PC Engine controller helper is already current."
+    echo "  Action: SKIP"
+fi
+
+if [[ ! -x "$MEDNAFEN_PCE_CONTROL_HELPER" ]]; then
+    die "PC Engine controller helper build failed."
+fi
+
+if [[ ! -f "$MEDNAFEN_PCE_CONFIG" ]]; then
+    echo "Creating isolated Mednafen profile..."
+
+    MEDNAFEN_HOME="$MEDNAFEN_PCE_PROFILE" \
+        "$MEDNAFEN_PCE_EXE" -help \
+        > "$LOG_DIR/mednafen-pcengine-profile.log" \
+        2>&1 || true
+
+    echo "  Action: CREATE"
+else
+    echo "Isolated Mednafen profile already exists."
+    echo "  Action: PRESERVE"
+fi
+
+if [[ ! -f "$MEDNAFEN_PCE_CONFIG" ]]; then
+    die "Mednafen did not create the PC Engine profile."
+fi
+
+MEDNAFEN_PCE_CONFIG_PATH="$MEDNAFEN_PCE_CONFIG" python3 - <<'PYMEDNAFEN'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MEDNAFEN_PCE_CONFIG_PATH"])
+original = path.read_text()
+lines = original.splitlines()
+
+enforced = {
+    "command.exit": "keyboard 0x0 41",
+}
+
+defaults = {
+    "pce_fast.input.port1.gamepad.up": "keyboard 0x0 82",
+    "pce_fast.input.port1.gamepad.down": "keyboard 0x0 81",
+    "pce_fast.input.port1.gamepad.left": "keyboard 0x0 80",
+    "pce_fast.input.port1.gamepad.right": "keyboard 0x0 79",
+    "pce_fast.input.port1.gamepad.i": "keyboard 0x0 27",
+    "pce_fast.input.port1.gamepad.ii": "keyboard 0x0 29",
+    "pce_fast.input.port1.gamepad.run": "keyboard 0x0 40",
+    "pce_fast.input.port1.gamepad.select": "keyboard 0x0 43",
+}
+
+seen = set()
+
+for index, line in enumerate(lines):
+    parts = line.split(None, 1)
+
+    if not parts:
+        continue
+
+    key = parts[0]
+
+    if key in enforced:
+        lines[index] = f"{key} {enforced[key]}"
+        seen.add(key)
+    elif key in defaults:
+        seen.add(key)
+
+        if len(parts) == 1 or not parts[1].strip():
+            lines[index] = f"{key} {defaults[key]}"
+
+for key, value in {**enforced, **defaults}.items():
+    if key not in seen:
+        lines.append(f"{key} {value}")
+
+updated = "\n".join(lines) + "\n"
+
+if updated != original:
+    path.write_text(updated)
+
+resolved = {}
+
+for line in lines:
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+if resolved.get("command.exit") != enforced["command.exit"]:
+    raise SystemExit("Could not enforce Mednafen Esc binding")
+
+for key in defaults:
+    if not resolved.get(key):
+        raise SystemExit(f"Empty Mednafen input binding: {key}")
+
+print("  Keyboard controls: OK")
+print("  Esc exit binding: OK")
+PYMEDNAFEN
+
+# ------------------------------------------------------------
+# PC Engine portable controller baseline
+#
+# Gameplay is driven through the BareFront SDL controller helper,
+# which translates normalized controller buttons to these keyboard
+# bindings.  Migrate only BareFront's known legacy hard-coded Xbox
+# mapping; preserve genuinely custom controller configurations.
+# ------------------------------------------------------------
+
+MEDNAFEN_PCE_CONFIG_PATH="$MEDNAFEN_PCE_CONFIG" python3 - <<'PYMEDNAFEN_PCE_PAD'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MEDNAFEN_PCE_CONFIG_PATH"])
+original = path.read_text()
+lines = original.splitlines()
+
+legacy_joy = "0x0006045e0b1205010008000b00000000"
+
+legacy_xbox = {
+    "pce_fast.input.port1.gamepad.up":
+        f"joystick {legacy_joy} abs_7-",
+    "pce_fast.input.port1.gamepad.down":
+        f"joystick {legacy_joy} abs_7+",
+    "pce_fast.input.port1.gamepad.left":
+        f"joystick {legacy_joy} abs_6-",
+    "pce_fast.input.port1.gamepad.right":
+        f"joystick {legacy_joy} abs_6+",
+    "pce_fast.input.port1.gamepad.i":
+        f"joystick {legacy_joy} button_0",
+    "pce_fast.input.port1.gamepad.ii":
+        f"joystick {legacy_joy} button_1",
+    "pce_fast.input.port1.gamepad.run":
+        f"joystick {legacy_joy} button_7",
+    "pce_fast.input.port1.gamepad.select":
+        f"joystick {legacy_joy} button_6",
+}
+
+keyboard = {
+    "pce_fast.input.port1.gamepad.up": "keyboard 0x0 82",
+    "pce_fast.input.port1.gamepad.down": "keyboard 0x0 81",
+    "pce_fast.input.port1.gamepad.left": "keyboard 0x0 80",
+    "pce_fast.input.port1.gamepad.right": "keyboard 0x0 79",
+    "pce_fast.input.port1.gamepad.i": "keyboard 0x0 27",
+    "pce_fast.input.port1.gamepad.ii": "keyboard 0x0 29",
+    "pce_fast.input.port1.gamepad.run": "keyboard 0x0 40",
+    "pce_fast.input.port1.gamepad.select": "keyboard 0x0 43",
+}
+
+resolved = {}
+
+for line in lines:
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+current = {
+    key: resolved.get(key, "")
+    for key in keyboard
+}
+
+if current == keyboard:
+    print("  Portable controller mapping: CURRENT")
+
+else:
+    safe_to_migrate = all(
+        current[key] in (
+            "",
+            keyboard[key],
+            legacy_xbox[key],
+        )
+        for key in keyboard
+    )
+
+    if safe_to_migrate:
+        seen = set()
+
+        for index, line in enumerate(lines):
+            parts = line.split(None, 1)
+
+            if not parts:
+                continue
+
+            key = parts[0]
+
+            if key in keyboard:
+                lines[index] = f"{key} {keyboard[key]}"
+                seen.add(key)
+
+        for key, value in keyboard.items():
+            if key not in seen:
+                lines.append(f"{key} {value}")
+
+        path.write_text("\n".join(lines) + "\n")
+
+        print("  Portable controller mapping: MIGRATED")
+
+    else:
+        print("  Portable controller mapping: PRESERVE CUSTOM")
+
+resolved = {}
+
+for line in path.read_text().splitlines():
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+for key in keyboard:
+    if not resolved.get(key):
+        raise SystemExit(
+            f"Empty PC Engine controller binding after migration: {key}"
+        )
+
+print("  PC Engine controller bindings: OK")
+PYMEDNAFEN_PCE_PAD
+
+MEDNAFEN_PCE_PACKAGE_VERSION="$(
+    dpkg-query -W -f='${Version}' mednafen 2>/dev/null || true
+)"
+
+cat > "$MEDNAFEN_PCE_LOCAL_DIR/PCENGINE_VERSION.txt" <<EOF
+BareFront managed emulator integration
+System: PC Engine / TurboGrafx-16 / SuperGrafx / CD
+Emulator: Mednafen
+Package version: ${MEDNAFEN_PCE_PACKAGE_VERSION:-Unknown}
+Executable: $MEDNAFEN_PCE_EXE
+BareFront launcher: $MEDNAFEN_PCE_LAUNCHER
+BareFront profile: $MEDNAFEN_PCE_PROFILE
+CD BIOS path: $BAREFRONT_DIR/bios/pcengine/syscard3.pce
+EOF
+
+echo
+echo "Verifying PC Engine integration..."
+echo "  System executable: OK"
+echo "  BareFront launcher: OK"
+echo "  Isolated profile: OK"
+echo "  Gamescope presentation: OK"
+echo "  vkBasalt Vulkan layer: OK"
+echo "  BareCRT shader: OK"
+echo "  PC Engine overlay: OK"
+echo "  Screenshot/video folders: OK"
+echo "  Audio: BareFront-selected HDMI -> direct ALSA / 48 kHz / 20 ms"
+echo
+echo "BareFront-owned controls:"
+echo "  Esc = return directly to BareFront"
+echo
+echo "PC Engine integration stage complete."
+
+
+# ============================================================
+# Stage 3C - Sega Saturn / Mednafen
+# ============================================================
+
+heading "STAGE 3C / SATURN"
+
+MEDNAFEN_SATURN_EXE="/usr/games/mednafen"
+MEDNAFEN_SATURN_GAMESCOPE="$BAREFRONT_GAMESCOPE"
+MEDNAFEN_SATURN_LOCAL_DIR="$BAREFRONT_DIR/emulators/mednafen"
+MEDNAFEN_SATURN_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mednafen_saturn.sh"
+MEDNAFEN_SATURN_PROFILE="$BAREFRONT_DIR/saves/saturn/mednafen"
+MEDNAFEN_SATURN_CONFIG="$MEDNAFEN_SATURN_PROFILE/mednafen.cfg"
+MEDNAFEN_SATURN_OVERLAY="$BAREFRONT_DIR/assets/overlays/saturn.png"
+MEDNAFEN_SATURN_CONTROL_SOURCE="$BAREFRONT_DIR/src/saturn_controller_helper.cpp"
+MEDNAFEN_SATURN_CONTROL_HELPER="$MEDNAFEN_SATURN_LOCAL_DIR/saturn_controller_helper"
+
+echo "Configuring BareFront Saturn integration..."
+echo
+
+if [[ ! -x "$MEDNAFEN_SATURN_EXE" ]]; then
+    die "Mednafen executable not found: $MEDNAFEN_SATURN_EXE"
+fi
+
+if [[ ! -x "$MEDNAFEN_SATURN_GAMESCOPE" ]]; then
+    die "Gamescope executable not found: $MEDNAFEN_SATURN_GAMESCOPE"
+fi
+
+if [[ ! -f "$MEDNAFEN_SATURN_LAUNCHER" ]]; then
+    die "Tracked Saturn launcher missing: $MEDNAFEN_SATURN_LAUNCHER"
+fi
+
+chmod +x "$MEDNAFEN_SATURN_LAUNCHER"
+
+if [[ ! -x "$MEDNAFEN_SATURN_LAUNCHER" ]]; then
+    die "Saturn launcher is not executable."
+fi
+
+if [[ ! -s "$MEDNAFEN_SATURN_OVERLAY" ]]; then
+    die "Tracked Saturn overlay missing: $MEDNAFEN_SATURN_OVERLAY"
+fi
+
+mkdir -p \
+    "$MEDNAFEN_SATURN_LOCAL_DIR" \
+    "$MEDNAFEN_SATURN_PROFILE" \
+    "$BAREFRONT_DIR/bios/saturn" \
+    "$BAREFRONT_DIR/roms/saturn" \
+    "$BAREFRONT_DIR/saves/saturn" \
+    "$BAREFRONT_DIR/assets/games/saturn" \
+    "$BAREFRONT_DIR/assets/videos/saturn"
+
+# ------------------------------------------------------------
+# Saturn BareFront controller helper
+# Guide hold = exit
+# LB+RB+Y = next disc
+# ------------------------------------------------------------
+
+if [[ ! -f "$MEDNAFEN_SATURN_CONTROL_SOURCE" ]]; then
+    die "Saturn controller helper source is missing: $MEDNAFEN_SATURN_CONTROL_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "Saturn controller helper build dependencies are missing."
+fi
+
+if [[ ! -x "$MEDNAFEN_SATURN_CONTROL_HELPER" ]] ||
+   [[ "$MEDNAFEN_SATURN_CONTROL_SOURCE" -nt "$MEDNAFEN_SATURN_CONTROL_HELPER" ]]
+then
+    echo
+    echo "Building Saturn BareFront controller helper..."
+
+    MEDNAFEN_SATURN_CONTROL_TEMP="$(
+        mktemp "$MEDNAFEN_SATURN_LOCAL_DIR/.saturn-control-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$MEDNAFEN_SATURN_CONTROL_SOURCE" \
+        -o "$MEDNAFEN_SATURN_CONTROL_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$MEDNAFEN_SATURN_CONTROL_TEMP"
+        die "Saturn controller helper compilation failed."
+    fi
+
+    chmod 0755 "$MEDNAFEN_SATURN_CONTROL_TEMP"
+    mv -fT --         "$MEDNAFEN_SATURN_CONTROL_TEMP"         "$MEDNAFEN_SATURN_CONTROL_HELPER"
+
+    echo "  Action: BUILD"
+else
+    echo
+    echo "Saturn controller helper is already current."
+    echo "  Action: SKIP"
+fi
+
+if [[ ! -x "$MEDNAFEN_SATURN_CONTROL_HELPER" ]]; then
+    die "Saturn controller helper verification failed."
+fi
+
+if [[ ! -f "$MEDNAFEN_SATURN_CONFIG" ]]; then
+    echo "Creating isolated Mednafen profile..."
+
+    MEDNAFEN_HOME="$MEDNAFEN_SATURN_PROFILE" \
+        "$MEDNAFEN_SATURN_EXE" -help \
+        > "$LOG_DIR/mednafen-saturn-profile.log" \
+        2>&1 || true
+
+    echo "  Action: CREATE"
+else
+    echo "Isolated Mednafen profile already exists."
+    echo "  Action: PRESERVE"
+fi
+
+if [[ ! -f "$MEDNAFEN_SATURN_CONFIG" ]]; then
+    die "Mednafen did not create the Saturn profile."
+fi
+
+MEDNAFEN_SATURN_CONFIG_PATH="$MEDNAFEN_SATURN_CONFIG" python3 - <<'PYMEDNAFEN_SATURN'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MEDNAFEN_SATURN_CONFIG_PATH"])
+original = path.read_text()
+lines = original.splitlines()
+
+enforced = {
+    "command.exit": "keyboard 0x0 41",
+    "ss.correct_aspect": "0",
+    "ss.stretch": "0",
+    "ss.videoip": "0",
+    "ss.shader": "none",
+    "ss.special": "none",
+    "ss.scanlines": "0",
+    "ss.xscale": "1.000000",
+    "ss.yscale": "1.000000",
+}
+
+defaults = {
+    "ss.input.port1.gamepad.up": "keyboard 0x0 82",
+    "ss.input.port1.gamepad.down": "keyboard 0x0 81",
+    "ss.input.port1.gamepad.left": "keyboard 0x0 80",
+    "ss.input.port1.gamepad.right": "keyboard 0x0 79",
+    "ss.input.port1.gamepad.a": "keyboard 0x0 29",
+    "ss.input.port1.gamepad.b": "keyboard 0x0 27",
+    "ss.input.port1.gamepad.c": "keyboard 0x0 6",
+    "ss.input.port1.gamepad.x": "keyboard 0x0 4",
+    "ss.input.port1.gamepad.y": "keyboard 0x0 22",
+    "ss.input.port1.gamepad.z": "keyboard 0x0 7",
+    "ss.input.port1.gamepad.ls": "keyboard 0x0 20",
+    "ss.input.port1.gamepad.rs": "keyboard 0x0 8",
+    "ss.input.port1.gamepad.start": "keyboard 0x0 40",
+}
+
+seen = set()
+
+for index, line in enumerate(lines):
+    parts = line.split(None, 1)
+
+    if not parts:
+        continue
+
+    key = parts[0]
+
+    if key in enforced:
+        lines[index] = f"{key} {enforced[key]}"
+        seen.add(key)
+    elif key in defaults:
+        seen.add(key)
+
+        if len(parts) == 1 or not parts[1].strip():
+            lines[index] = f"{key} {defaults[key]}"
+
+for key, value in {**enforced, **defaults}.items():
+    if key not in seen:
+        lines.append(f"{key} {value}")
+
+updated = "\n".join(lines) + "\n"
+
+if updated != original:
+    path.write_text(updated)
+
+resolved = {}
+
+for line in lines:
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+for key, value in enforced.items():
+    if resolved.get(key) != value:
+        raise SystemExit(f"Could not enforce Saturn setting: {key}")
+
+for key in defaults:
+    if not resolved.get(key):
+        raise SystemExit(f"Empty Saturn input binding: {key}")
+
+print("  Keyboard controls: OK")
+print("  No visual filtering: OK")
+print("  Esc exit binding: OK")
+PYMEDNAFEN_SATURN
+
+# ------------------------------------------------------------
+# Saturn portable controller baseline
+#
+# Gameplay is driven through the BareFront SDL controller helper,
+# which translates normalized controller inputs to these keyboard
+# bindings. Migrate only known Mednafen defaults, older BareFront
+# defaults, and BareFront's legacy hard-coded Xbox mapping.
+# Preserve genuinely custom controller configurations.
+# ------------------------------------------------------------
+
+MEDNAFEN_SATURN_CONFIG_PATH="$MEDNAFEN_SATURN_CONFIG" python3 - <<'PYMEDNAFEN_SATURN_PAD'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MEDNAFEN_SATURN_CONFIG_PATH"])
+original = path.read_text()
+lines = original.splitlines()
+
+legacy_joy = "0x0006045e0b1205010008000b00000000"
+
+legacy_xbox = {
+    "ss.input.port1.gamepad.a":
+        f"joystick {legacy_joy} button_2",
+    "ss.input.port1.gamepad.b":
+        f"joystick {legacy_joy} button_0",
+    "ss.input.port1.gamepad.c":
+        f"joystick {legacy_joy} button_1",
+    "ss.input.port1.gamepad.down":
+        f"joystick {legacy_joy} abs_7+",
+    "ss.input.port1.gamepad.left":
+        f"joystick {legacy_joy} abs_6-",
+    "ss.input.port1.gamepad.ls":
+        f"joystick {legacy_joy} abs_2-+",
+    "ss.input.port1.gamepad.right":
+        f"joystick {legacy_joy} abs_6+",
+    "ss.input.port1.gamepad.rs":
+        f"joystick {legacy_joy} abs_5-+",
+    "ss.input.port1.gamepad.start":
+        f"joystick {legacy_joy} button_7",
+    "ss.input.port1.gamepad.up":
+        f"joystick {legacy_joy} abs_7-",
+    "ss.input.port1.gamepad.x":
+        f"joystick {legacy_joy} button_3",
+    "ss.input.port1.gamepad.y":
+        f"joystick {legacy_joy} button_4",
+    "ss.input.port1.gamepad.z":
+        f"joystick {legacy_joy} button_5",
+}
+
+mednafen_keyboard = {
+    "ss.input.port1.gamepad.a": "keyboard 0x0 89",
+    "ss.input.port1.gamepad.b": "keyboard 0x0 90",
+    "ss.input.port1.gamepad.c": "keyboard 0x0 91",
+    "ss.input.port1.gamepad.down": "keyboard 0x0 22",
+    "ss.input.port1.gamepad.left": "keyboard 0x0 4",
+    "ss.input.port1.gamepad.ls": "keyboard 0x0 95",
+    "ss.input.port1.gamepad.right": "keyboard 0x0 7",
+    "ss.input.port1.gamepad.rs": "keyboard 0x0 97",
+    "ss.input.port1.gamepad.start": "keyboard 0x0 40",
+    "ss.input.port1.gamepad.up": "keyboard 0x0 26",
+    "ss.input.port1.gamepad.x": "keyboard 0x0 92",
+    "ss.input.port1.gamepad.y": "keyboard 0x0 93",
+    "ss.input.port1.gamepad.z": "keyboard 0x0 94",
+}
+
+keyboard = {
+    "ss.input.port1.gamepad.up": "keyboard 0x0 82",
+    "ss.input.port1.gamepad.down": "keyboard 0x0 81",
+    "ss.input.port1.gamepad.left": "keyboard 0x0 80",
+    "ss.input.port1.gamepad.right": "keyboard 0x0 79",
+    "ss.input.port1.gamepad.a": "keyboard 0x0 29",
+    "ss.input.port1.gamepad.b": "keyboard 0x0 27",
+    "ss.input.port1.gamepad.c": "keyboard 0x0 6",
+    "ss.input.port1.gamepad.x": "keyboard 0x0 4",
+    "ss.input.port1.gamepad.y": "keyboard 0x0 22",
+    "ss.input.port1.gamepad.z": "keyboard 0x0 7",
+    "ss.input.port1.gamepad.ls": "keyboard 0x0 20",
+    "ss.input.port1.gamepad.rs": "keyboard 0x0 8",
+    "ss.input.port1.gamepad.start": "keyboard 0x0 40",
+}
+
+resolved = {}
+
+for line in lines:
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+current = {
+    key: resolved.get(key, "")
+    for key in keyboard
+}
+
+if current == keyboard:
+    print("  Portable controller mapping: CURRENT")
+
+else:
+    safe_to_migrate = all(
+        current[key] in (
+            "",
+            keyboard[key],
+            mednafen_keyboard[key],
+            legacy_xbox[key],
+        )
+        for key in keyboard
+    )
+
+    if safe_to_migrate:
+        seen = set()
+
+        for index, line in enumerate(lines):
+            parts = line.split(None, 1)
+
+            if not parts:
+                continue
+
+            key = parts[0]
+
+            if key in keyboard:
+                lines[index] = f"{key} {keyboard[key]}"
+                seen.add(key)
+
+        for key, value in keyboard.items():
+            if key not in seen:
+                lines.append(f"{key} {value}")
+
+        path.write_text("\n".join(lines) + "\n")
+
+        print("  Portable controller mapping: MIGRATED")
+
+    else:
+        print("  Portable controller mapping: PRESERVE CUSTOM")
+
+resolved = {}
+
+for line in path.read_text().splitlines():
+    parts = line.split(None, 1)
+
+    if len(parts) == 2:
+        resolved[parts[0]] = parts[1].strip()
+
+for key in keyboard:
+    if not resolved.get(key):
+        raise SystemExit(
+            f"Empty Saturn controller binding after migration: {key}"
+        )
+
+print("  Saturn controller bindings: OK")
+PYMEDNAFEN_SATURN_PAD
+
+MEDNAFEN_SATURN_PACKAGE_VERSION="$(
+    dpkg-query -W -f='${Version}' mednafen 2>/dev/null || true
+)"
+
+cat > "$MEDNAFEN_SATURN_LOCAL_DIR/SATURN_VERSION.txt" <<EOF
+BareFront managed emulator integration
+System: Sega Saturn
+Emulator: Mednafen
+Package version: ${MEDNAFEN_SATURN_PACKAGE_VERSION:-Unknown}
+Executable: $MEDNAFEN_SATURN_EXE
+BareFront launcher: $MEDNAFEN_SATURN_LAUNCHER
+BareFront profile: $MEDNAFEN_SATURN_PROFILE
+North America / Europe BIOS: $BAREFRONT_DIR/bios/saturn/mpr-17933.bin
+Japan BIOS: $BAREFRONT_DIR/bios/saturn/sega_101.bin
+EOF
+
+echo
+echo "Verifying Saturn integration..."
+echo "  System executable: OK"
+echo "  Gamescope: OK"
+echo "  BareFront launcher: OK"
+echo "  Presentation overlay: OK"
+echo "  Isolated profile: OK"
+echo "  Controller helper: OK"
+echo
+echo "BareFront-owned controls:"
+echo "  Esc = return directly to BareFront"
+echo "  Guide tap = ignored"
+echo "  Guide hold 1.5 s = return directly to BareFront"
+echo "  LB+RB+Y = next disc in a multidisc playlist"
+echo
+echo "Saturn integration stage complete."
+
+
+# ============================================================
+# Stage 4 - Production BareFront configuration
+# ============================================================
+
+heading "STAGE 4 / PRODUCTION CONFIGURATION"
+
+CONFIG_FILE="$BAREFRONT_DIR/barefront.ini"
+CONFIG_CONFLICT="$LOG_DIR/barefront.ini.generated"
+VICE_LAUNCHER="$BAREFRONT_DIR/scripts/launch_vice.sh"
+VICE_HOTKEY_DIR="$BAREFRONT_DIR/emulators/vice"
+VICE_HOTKEY_FILE="$VICE_HOTKEY_DIR/barefront.vhk"
+VICE_PRESENTATION_SOURCE="$BAREFRONT_DIR/src/c64_presentation_helper.cpp"
+VICE_PRESENTATION_HELPER="$BAREFRONT_DIR/c64_presentation_helper"
+VICE_GUIDE_SOURCE="$BAREFRONT_DIR/src/vice_guide_exit_helper.cpp"
+VICE_GUIDE_DIR="$BAREFRONT_DIR/emulators/vice"
+VICE_GUIDE_HELPER="$VICE_GUIDE_DIR/vice_guide_exit_helper"
+VICE_KEYBOARD_SOURCE="$BAREFRONT_DIR/src/vice_keyboard_helper.cpp"
+VICE_KEYBOARD_HELPER="$VICE_GUIDE_DIR/vice_keyboard_helper"
+VICE_JOYMAP_FILE="$VICE_GUIDE_DIR/barefront-c64-xbox.vjm"
+VICE_KEYMAP_FILE="$VICE_GUIDE_DIR/barefront-c64.vkm"
+VICE_BEZEL="$BAREFRONT_DIR/assets/overlays/plain/c64.png"
+VICE_BEZEL_SHADER="$BAREFRONT_DIR/assets/shaders/c64/BareFront_C64_Bezel.fx"
+MAME_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mame.sh"
+MAME_ARCADE_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mame_arcade.sh"
+MAME_NEOGEO_LAUNCHER="$BAREFRONT_DIR/scripts/launch_mame_neogeo.sh"
+
+# ------------------------------------------------------------
+# MAME Guide exit helper — Xbox Guide
+# ------------------------------------------------------------
+
+MAME_GUIDE_SOURCE="$BAREFRONT_DIR/src/mame_guide_exit_helper.cpp"
+MAME_GUIDE_DIR="$BAREFRONT_DIR/emulators/mame"
+MAME_GUIDE_HELPER="$MAME_GUIDE_DIR/mame_guide_exit_helper"
+
+if [[ ! -f "$MAME_GUIDE_SOURCE" ]]; then
+    die "MAME Guide helper source is missing: $MAME_GUIDE_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1 ||
+   ! command -v sdl2-config >/dev/null 2>&1
+then
+    die "MAME Guide helper build dependencies are missing."
+fi
+
+mkdir -p "$MAME_GUIDE_DIR"
+
+if [[ ! -x "$MAME_GUIDE_HELPER" ]] ||
+   [[ "$MAME_GUIDE_SOURCE" -nt "$MAME_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building MAME Xbox Guide exit helper..."
+
+    MAME_GUIDE_CANDIDATE="$(
+        mktemp "$MAME_GUIDE_DIR/.mame-guide-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 \
+        "$MAME_GUIDE_SOURCE" \
+        -o "$MAME_GUIDE_CANDIDATE" \
+        $(sdl2-config --cflags --libs) \
+        -lX11 -lXtst
+    then
+        rm -f -- "$MAME_GUIDE_CANDIDATE"
+        die "MAME Guide helper compilation failed."
+    fi
+
+    chmod 755 "$MAME_GUIDE_CANDIDATE"
+    mv -fT "$MAME_GUIDE_CANDIDATE" "$MAME_GUIDE_HELPER"
+
+    echo "Action: BUILD"
+else
+    echo
+    echo "MAME Guide exit helper is already current."
+    echo "Action: SKIP"
+fi
+
+if [[ ! -x "$MAME_GUIDE_HELPER" ]]; then
+    die "MAME Guide exit helper build failed."
+fi
+
+
+
+mkdir -p "$BAREFRONT_DIR/scripts"
+mkdir -p "$VICE_HOTKEY_DIR"
+
+
+# ------------------------------------------------------------
+# VICE launcher adapter
+#
+# BareFront deliberately keeps emulator-specific setup outside
+# the C++ frontend.
+#
+# The Debian VICE executable needs several C64 ROM paths on the
+# command line in our known-working setup. Keeping that detail
+# inside this adapter gives barefront.ini a simple:
+#
+#   emulator=.../launch_vice.sh
+#   arguments={rom}
+#
+# The end user never has to type or maintain those arguments.
+# ------------------------------------------------------------
+
+echo "Creating/verifying C64 VICE launcher..."
+
+if [[ ! -f "$VICE_PRESENTATION_SOURCE" ]]; then
+    die "C64 presentation helper source is missing: $VICE_PRESENTATION_SOURCE"
+fi
+
+if [[ ! -f "$VICE_BEZEL" ]]; then
+    die "C64 presentation bezel is missing: $VICE_BEZEL"
+fi
+
+if [[ ! -f "$VICE_BEZEL_SHADER" ]]; then
+    die "C64 bezel shader is missing: $VICE_BEZEL_SHADER"
+fi
+
+if [[ ! -x "$VICE_PRESENTATION_HELPER" ]] || \
+   [[ "$VICE_PRESENTATION_SOURCE" -nt "$VICE_PRESENTATION_HELPER" ]]
+then
+    echo
+    echo "Building C64 presentation helper..."
+
+    if ! g++ \
+        -std=c++17 \
+        -O2 \
+        -Wall \
+        -Wextra \
+        -pedantic \
+        "$VICE_PRESENTATION_SOURCE" \
+        -o "$VICE_PRESENTATION_HELPER" \
+        -lX11
+    then
+        die "C64 presentation helper build failed."
+    fi
+
+    echo "  Action: BUILD"
+else
+    echo
+    echo "C64 presentation helper is already current."
+    echo "  Action: SKIP"
+fi
+
+if [[ ! -x "$VICE_PRESENTATION_HELPER" ]]; then
+    die "C64 presentation helper executable is missing after build."
+fi
+
+echo "  C64 presentation helper: OK"
+
+# ------------------------------------------------------------
+# VICE Xbox Guide exit helper
+# ------------------------------------------------------------
+
+if [[ ! -f "$VICE_GUIDE_SOURCE" ]]; then
+    die "VICE Guide helper source missing: $VICE_GUIDE_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+    die "g++ is required for the VICE Guide helper."
+fi
+
+if ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "VICE Guide helper build dependencies are missing."
+fi
+
+mkdir -p "$VICE_GUIDE_DIR"
+
+if [[ ! -x "$VICE_GUIDE_HELPER" ]] ||
+   [[ "$VICE_GUIDE_SOURCE" -nt "$VICE_GUIDE_HELPER" ]]
+then
+    echo
+    echo "Building VICE Xbox Guide helper..."
+
+    VICE_GUIDE_TEMP="$(
+        mktemp "$VICE_GUIDE_DIR/.vice-guide-build.XXXXXX"
+    )"
+
+    if ! g++ -std=c++17 -O2 -Wall -Wextra \
+        "$VICE_GUIDE_SOURCE" \
+        -o "$VICE_GUIDE_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$VICE_GUIDE_TEMP"
+        die "VICE Guide helper compilation failed."
+    fi
+
+    chmod 0755 "$VICE_GUIDE_TEMP"
+    mv -fT -- "$VICE_GUIDE_TEMP" "$VICE_GUIDE_HELPER"
+
+    echo "VICE Xbox Guide helper built."
+else
+    echo "VICE Xbox Guide helper already built."
+fi
+
+if [[ ! -x "$VICE_GUIDE_HELPER" ]]; then
+    die "VICE Guide helper verification failed."
+fi
+
+echo "  VICE Xbox Guide helper: OK"
+
+# ------------------------------------------------------------
+# VICE controller-native on-screen keyboard helper
+# ------------------------------------------------------------
+
+if [[ ! -f "$VICE_KEYBOARD_SOURCE" ]]; then
+    die "VICE keyboard helper source missing: $VICE_KEYBOARD_SOURCE"
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+    die "g++ is required for the VICE keyboard helper."
+fi
+
+if ! command -v pkg-config >/dev/null 2>&1 ||
+   ! pkg-config --exists sdl2 x11 xtst
+then
+    die "VICE keyboard helper build dependencies are missing."
+fi
+
+mkdir -p "$VICE_GUIDE_DIR"
+
+if [[ ! -x "$VICE_KEYBOARD_HELPER" ]] ||
+   [[ "$VICE_KEYBOARD_SOURCE" -nt "$VICE_KEYBOARD_HELPER" ]]
+then
+    echo
+    echo "Building VICE controller keyboard helper..."
+
+    VICE_KEYBOARD_TEMP="$(
+        mktemp "$VICE_GUIDE_DIR/.vice-keyboard-build.XXXXXX"
+    )"
+
+    if ! g++ \
+        -std=c++17 \
+        -Wall \
+        -Wextra \
+        -Wpedantic \
+        -Werror \
+        "$VICE_KEYBOARD_SOURCE" \
+        -o "$VICE_KEYBOARD_TEMP" \
+        $(pkg-config --cflags --libs sdl2 x11 xtst)
+    then
+        rm -f -- "$VICE_KEYBOARD_TEMP"
+        die "VICE keyboard helper compilation failed."
+    fi
+
+    chmod 0755 "$VICE_KEYBOARD_TEMP"
+    mv -fT -- "$VICE_KEYBOARD_TEMP" "$VICE_KEYBOARD_HELPER"
+
+    echo "VICE controller keyboard helper built."
+else
+    echo "VICE controller keyboard helper already built."
+fi
+
+if [[ ! -x "$VICE_KEYBOARD_HELPER" ]]; then
+    die "VICE keyboard helper verification failed."
+fi
+
+echo "  VICE controller keyboard helper: OK"
+
+# These are curated BareFront assets, not user VICE configuration.
+# The launcher copies the joymap into the user's VICE profile as needed.
+if [[ ! -f "$VICE_JOYMAP_FILE" ]]; then
+    die "BareFront C64 Xbox joymap missing: $VICE_JOYMAP_FILE"
+fi
+
+if [[ ! -f "$VICE_KEYMAP_FILE" ]]; then
+    die "BareFront C64 keyboard map missing: $VICE_KEYMAP_FILE"
+fi
+
+if ! grep -qx 'F9 7 7 8' "$VICE_KEYMAP_FILE"; then
+    die "BareFront C64 keyboard map is missing the private RUN/STOP mapping."
+fi
+
+echo "  BareFront C64 Xbox joymap: OK"
+echo "  BareFront C64 keyboard map: OK"
+
+VICE_DEFAULT_HOTKEYS="/usr/share/vice/hotkeys/hotkeys.vhk"
+
+if [[ ! -f "$VICE_DEFAULT_HOTKEYS" ]]; then
+    die "VICE default hotkey file is missing: $VICE_DEFAULT_HOTKEYS"
+fi
+
+cp "$VICE_DEFAULT_HOTKEYS" "$VICE_HOTKEY_FILE"
+
+cat >> "$VICE_HOTKEY_FILE" <<'EOF'
+
+# BareFront integration
+quit    Escape
+EOF
+
+echo "  BareFront VICE hotkeys: OK"
+echo "  $VICE_HOTKEY_FILE"
+echo "  Esc: exit directly to BareFront"
+
+cat > "$VICE_LAUNCHER" <<'__BAREFRONT_VICE_LAUNCHER__'
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODE=""
+if [[ "${1:-}" == "--dry-run" ]]; then
+    MODE="--dry-run"
+    shift
+fi
+ROM="${1:-}"
+
+VICE="/usr/bin/x64sc"
+source "$ROOT/scripts/barefront_presentation_runtime.sh"
+barefront_resolve_presentation_runtime "$ROOT"
+GAMESCOPE="$BAREFRONT_GAMESCOPE"
+export VK_IMPLICIT_LAYER_PATH="$BAREFRONT_VKBASALT_LAYER_DIR"
+PRESENTATION_HELPER="$ROOT/c64_presentation_helper"
+GUIDE_HELPER="$ROOT/emulators/vice/vice_guide_exit_helper"
+KEYBOARD_HELPER="$ROOT/emulators/vice/vice_keyboard_helper"
+C64_KEYMAP="$ROOT/emulators/vice/barefront-c64.vkm"
+
+# BareFront owns the C64 GTK3 joystick map so controller
+# behaviour is deterministic on every installation.
+JOYMAP_SOURCE="$ROOT/emulators/vice/barefront-c64-xbox.vjm"
+JOYMAP_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vice"
+JOYMAP_FILE="$JOYMAP_DIR/gtk3-joymap-C64SC.vjm"
+
+NATIVE_WIDTH=408
+NATIVE_HEIGHT=293
+
+OUTPUT_WIDTH=1920
+OUTPUT_HEIGHT=1080
+
+C64_PAL_MODE="1920x1080_C64PAL"
+
+BEZEL="$ROOT/assets/overlays/plain/c64.png"
+BEZEL_SHADER="$ROOT/assets/shaders/c64/BareFront_C64_Bezel.fx"
+BARECRT_SHADER="$ROOT/assets/shaders/barecrt/BareCRT_v2.fx"
+
+VKBASALT_CONFIG="/tmp/barefront-vkbasalt-c64.conf"
+
+GAMESCOPE_PID=""
+PANELS_HIDDEN=0
+C64_TEXTURE_DIR=""
+C64_TEMP_DIR=""
+C64_TEMP_VFL=""
+
+DISPLAY_OUTPUT=""
+ORIGINAL_MODE=""
+ORIGINAL_RATE=""
+
+
+if [[ -z "$ROM" ]]; then
+    echo "Usage: launch_vice.sh <game-file>" >&2
+    exit 1
+fi
+
+
+# BareFront normally supplies a path relative to its root.
+# Convert it to an absolute path so VICE fliplist entries can
+# be resolved reliably regardless of the caller's directory.
+if [[ "$ROM" != /* ]]; then
+    ROM="$ROOT/${ROM#./}"
+fi
+
+
+if [[ ! -f "$ROM" ]]; then
+    echo "C64 game not found:" >&2
+    echo "  $ROM" >&2
+    exit 1
+fi
+
+
+
+for required in \
+    "$VICE" \
+    "$GAMESCOPE" \
+    "$PRESENTATION_HELPER" \
+    "$GUIDE_HELPER" \
+    "$KEYBOARD_HELPER"
+do
+    if [[ ! -x "$required" ]]; then
+        echo "Required C64 executable not found:" >&2
+        echo "  $required" >&2
+        exit 1
+    fi
+done
+
+
+for required in \
+    "$ROOT/bios/c64/basic-901226-01.bin" \
+    "$ROOT/bios/c64/kernal-901227-03.bin" \
+    "$ROOT/bios/c64/chargen-901225-01.bin" \
+    "$ROOT/bios/c64/dos1541-325302-01+901229-05.bin" \
+    "$BARECRT_SHADER" \
+    "$BEZEL_SHADER" \
+    "$BEZEL" \
+    "$C64_KEYMAP"
+do
+    if [[ ! -f "$required" ]]; then
+        echo "Required C64 file not found:" >&2
+        echo "  $required" >&2
+        exit 1
+    fi
+done
+
+
+export DISPLAY="${DISPLAY:-:0}"
+
+if [[ -z "${XAUTHORITY:-}" &&
+      -f "$HOME/.Xauthority" ]]
+then
+    export XAUTHORITY="$HOME/.Xauthority"
+fi
+
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+
+# ------------------------------------------------------------
+# Capture the current physical display state.
+#
+# The original mode/rate is restored when VICE exits.
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Per-system CRT selection.
+#
+# The C64 bezel is always the final effect, including NONE.
+# NONE disables CRT treatment, not the selected C64 artwork.
+# ------------------------------------------------------------
+
+PREFERENCES="${BAREFRONT_SHADER_PREFS:-$ROOT/saves/presentation/shaders.ini}"
+SHADER="NONE"
+
+if [[ -f "$PREFERENCES" ]]; then
+    while IFS='=' read -r key value; do
+        if [[ "$key" == "c64" ]]; then
+            SHADER="${value%$'\\r'}"
+        fi
+    done < "$PREFERENCES"
+fi
+
+EFFECTS="c64bezel"
+CRT_DECLARATION=""
+CRT_INCLUDE_DIR="$ROOT/assets/shaders/barecrt"
+CRT_SETTINGS=""
+CRT_SHADER_FILE=""
+
+case "$SHADER" in
+    NONE)
+        ;;
+
+    BARECRT)
+        EFFECTS="barecrt:c64bezel"
+        CRT_SHADER_FILE="$BARECRT_SHADER"
+        CRT_DECLARATION="barecrt = $CRT_SHADER_FILE"
+        CRT_SETTINGS="$(printf '%s\n' 'BareFrontScale = 3.0' 'BareFrontPhaseY = 1.0')"
+        ;;
+
+    CRT-LITE)
+        EFFECTS="CRT_Lite:c64bezel"
+        CRT_INCLUDE_DIR="$ROOT/assets/shaders/crt-lite"
+        CRT_SHADER_FILE="$CRT_INCLUDE_DIR/CRT_Lite.fx"
+        CRT_DECLARATION="CRT_Lite = $CRT_SHADER_FILE"
+        CRT_SETTINGS="SCANLINE_COUNT = 0.0"
+        ;;
+
+    CRT-LOTTES)
+        EFFECTS="CRT_Lottes:c64bezel"
+        CRT_INCLUDE_DIR="$ROOT/assets/shaders/crt-lottes"
+        CRT_SHADER_FILE="$CRT_INCLUDE_DIR/CRT_Lottes.fx"
+        CRT_DECLARATION="CRT_Lottes = $CRT_SHADER_FILE"
+        CRT_SETTINGS="$(printf '%s\n' 'fDownscale = 3.0' 'fBlur = 2.6')"
+        ;;
+
+    *)
+        echo "STOP: Invalid C64 shader preference: $SHADER" >&2
+        exit 1
+        ;;
+esac
+
+if [[ ! -f "$CRT_INCLUDE_DIR/ReShade.fxh" ]]; then
+    echo "STOP: Missing C64 shader include dependency." >&2
+    exit 1
+fi
+
+if [[ -n "$CRT_SHADER_FILE" &&
+      ! -f "$CRT_SHADER_FILE" ]]; then
+    echo "STOP: Missing selected C64 shader: $CRT_SHADER_FILE" >&2
+    exit 1
+fi
+
+if [[ "$SHADER" == "CRT-LOTTES" &&
+      ! -f "$CRT_INCLUDE_DIR/CRT_Lottes.fxh" ]]; then
+    echo "STOP: Missing CRT_Lottes.fxh" >&2
+    exit 1
+fi
+
+echo "Shader: $SHADER"
+echo "Effects: $EFFECTS"
+echo "CRT include: $CRT_INCLUDE_DIR"
+
+if [[ -n "$CRT_SETTINGS" ]]; then
+    printf '%s\n' "$CRT_SETTINGS"
+fi
+
+if [[ "$MODE" == "--dry-run" ]]; then
+    echo "PASS: Dry run only — no display changes or game launch."
+    exit 0
+fi
+
+XRANDR_STATE="$(xrandr --query)"
+
+DISPLAY_OUTPUT="$(
+    awk '
+        $2 == "connected" {
+            output = $1
+        }
+
+        /\*/ {
+            print output
+            exit
+        }
+    ' <<< "$XRANDR_STATE"
+)"
+
+ORIGINAL_MODE="$(
+    awk '
+        /\*/ {
+            print $1
+            exit
+        }
+    ' <<< "$XRANDR_STATE"
+)"
+
+ORIGINAL_RATE="$(
+    awk '
+        /\*/ {
+            for (i = 2; i <= NF; ++i) {
+                if ($i ~ /\*/) {
+                    gsub(/[\*\+]/, "", $i)
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' <<< "$XRANDR_STATE"
+)"
+
+
+if [[ -z "$DISPLAY_OUTPUT" ||
+      -z "$ORIGINAL_MODE" ||
+      -z "$ORIGINAL_RATE" ]]
+then
+    echo "Unable to determine the active X11 display mode." >&2
+    exit 1
+fi
+
+
+cleanup()
+{
+    local exit_code=$?
+
+    trap - EXIT INT TERM
+
+    if [[ -n "$GAMESCOPE_PID" ]]; then
+        kill "$GAMESCOPE_PID" \
+            >/dev/null 2>&1 || true
+
+        wait "$GAMESCOPE_PID" \
+            >/dev/null 2>&1 || true
+    fi
+
+    echo
+    echo "Restoring display:"
+    echo "  Output: $DISPLAY_OUTPUT"
+    echo "  Mode:   $ORIGINAL_MODE"
+    echo "  Rate:   $ORIGINAL_RATE"
+
+    xrandr \
+        --output "$DISPLAY_OUTPUT" \
+        --mode "$ORIGINAL_MODE" \
+        --rate "$ORIGINAL_RATE" \
+        >/dev/null 2>&1 || true
+
+    if [[ "$PANELS_HIDDEN" == "1" ]]; then
+        "$PRESENTATION_HELPER" show-panels \
+            >/dev/null 2>&1 || true
+    fi
+
+
+    if [[ -n "$C64_TEXTURE_DIR" ]]; then
+        rm -rf -- "$C64_TEXTURE_DIR"
+    fi
+
+    if [[ -n "$C64_TEMP_DIR" ]]; then
+        rm -rf -- "$C64_TEMP_DIR"
+    elif [[ -n "$C64_TEMP_VFL" ]]; then
+        rm -f -- "$C64_TEMP_VFL"
+    fi
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
+
+# Select C64 artwork without opening a separate X11 overlay.
+OVERLAY_ROOT="$ROOT/assets/overlays"
+OVERLAY_MAP="$OVERLAY_ROOT/overlays.ini"
+DEFAULT_C64="$OVERLAY_ROOT/plain/c64.png"
+C64_SELECTION="plain/c64.png"
+
+if [[ ! -f "$OVERLAY_MAP" ]]; then
+    OVERLAY_MAP="$OVERLAY_ROOT/overlays.ini.example"
+fi
+
+if [[ -f "$OVERLAY_MAP" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" == *=* ]] || continue
+
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key//[[:space:]]/}"
+
+        if [[ "$key" == "c64" ]]; then
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            C64_SELECTION="$value"
+        fi
+    done < "$OVERLAY_MAP"
+fi
+
+case "$C64_SELECTION" in
+    /*|*..*|*\\*|!*.png)
+        echo "Invalid C64 overlay selection: $C64_SELECTION"
+        C64_SELECTION="plain/c64.png"
+        ;;
+esac
+
+C64_SELECTED="$OVERLAY_ROOT/$C64_SELECTION"
+C64_VALIDATOR="$ROOT/overlay_helper"
+
+# The reference mask must itself be valid and available.
+if [[ ! -f "$DEFAULT_C64" ]] ||
+   ! "$C64_VALIDATOR" --validate-c64 \
+       "$DEFAULT_C64" "$DEFAULT_C64"; then
+    echo "Required plain C64 texture or validator unavailable." >&2
+    exit 1
+fi
+
+if [[ ! -f "$C64_SELECTED" ]] ||
+   ! "$C64_VALIDATOR" --validate-c64 \
+       "$C64_SELECTED" "$DEFAULT_C64"; then
+    echo "Invalid or missing C64 artwork: $C64_SELECTED"
+    C64_SELECTED="$DEFAULT_C64"
+fi
+
+C64_TEXTURE_DIR="$(mktemp -d /tmp/barefront-c64-texture.XXXXXX)"
+cp -- "$C64_SELECTED" "$C64_TEXTURE_DIR/c64.png"
+
+echo "C64 overlay: $C64_SELECTED"
+echo "C64 texture directory: $C64_TEXTURE_DIR"
+
+
+
+# ------------------------------------------------------------
+# Determine whether this output advertises 1080p50.
+#
+# BareFront only attempts the PAL-matched custom mode on a
+# display which already reports 1920x1080 at approximately
+# 50 Hz. Otherwise the existing display mode is retained.
+# ------------------------------------------------------------
+
+SUPPORTS_1080P50="$(
+    awk -v target="$DISPLAY_OUTPUT" '
+        $1 == target && $2 == "connected" {
+            inside = 1
+            next
+        }
+
+        inside && /^[^[:space:]]/ {
+            inside = 0
+        }
+
+        inside && $1 == "1920x1080" {
+            for (i = 2; i <= NF; ++i) {
+                rate = $i
+                gsub(/[\*\+]/, "", rate)
+
+                if (rate ~ /^50(\.0+)?$/) {
+                    print "yes"
+                    exit
+                }
+            }
+        }
+    ' <<< "$XRANDR_STATE"
+)"
+
+
+echo "Starting Commodore 64 through BareFront..."
+echo "  VICE:        PAL"
+echo "  Surface:     ${NATIVE_WIDTH}x${NATIVE_HEIGHT}"
+echo "  Gamescope:   ${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}"
+echo "  Scaling:     integer / nearest"
+echo "  Borders:     full"
+echo "  Shader:      $SHADER"
+echo "  Bezel:       black"
+
+
+# ------------------------------------------------------------
+# Release XFCE's panel work area BEFORE Gamescope is created.
+#
+# This allows the borderless 1920x1080 Gamescope window to be
+# placed at the real desktop origin instead of y=27.
+# ------------------------------------------------------------
+
+"$PRESENTATION_HELPER" hide-panels
+PANELS_HIDDEN=1
+
+sleep 1
+
+
+# ------------------------------------------------------------
+# PAL display timing.
+#
+# A real PAL C64 runs at approximately 50.12 Hz. The M7 display
+# accepts this custom 1080p mode and it removes the periodic
+# cadence judder visible at ordinary 50.000 Hz.
+#
+# If the display cannot use it, fall back to its advertised
+# 1080p50 mode. If even that fails, retain the original mode.
+# ------------------------------------------------------------
+
+if [[ "$SUPPORTS_1080P50" == "yes" ]]; then
+
+    xrandr --newmode \
+        "$C64_PAL_MODE" \
+        148.87 \
+        1920 2448 2492 2640 \
+        1080 1084 1089 1125 \
+        +HSync +VSync \
+        >/dev/null 2>&1 || true
+
+    xrandr --addmode \
+        "$DISPLAY_OUTPUT" \
+        "$C64_PAL_MODE" \
+        >/dev/null 2>&1 || true
+
+    if xrandr \
+        --output "$DISPLAY_OUTPUT" \
+        --mode "$C64_PAL_MODE"
+    then
+        echo "  Display:     PAL matched ~50.12 Hz"
+    elif xrandr \
+        --output "$DISPLAY_OUTPUT" \
+        --mode 1920x1080 \
+        --rate 50.00
+    then
+        echo "  Display:     50.00 Hz fallback"
+    else
+        echo "  Display:     original mode retained"
+    fi
+
+else
+    echo "  Display:     no advertised 1080p50; original mode retained"
+fi
+
+# Give the physical display and X11 stack time to settle on the
+# new refresh timing before Gamescope establishes its pacing.
+sleep 3
+
+
+# ------------------------------------------------------------
+# vkBasalt / ReShade presentation.
+#
+# BareCRT runs first. The C64 bezel is then composited inside
+# the same shader path, avoiding the separate X11 overlay
+# window which caused visible scrolling judder.
+# ------------------------------------------------------------
+
+cat > "$VKBASALT_CONFIG" <<EOF2
+effects = $EFFECTS
+
+$CRT_DECLARATION
+c64bezel = $BEZEL_SHADER
+
+reshadeIncludePath = $CRT_INCLUDE_DIR
+reshadeTexturePath = $C64_TEXTURE_DIR
+
+enableOnLaunch = True
+$CRT_SETTINGS
+EOF2
+
+
+if [[ ! -f "$JOYMAP_SOURCE" ]]; then
+    echo "Required BareFront C64 joymap not found:" >&2
+    echo "  $JOYMAP_SOURCE" >&2
+    exit 1
+fi
+
+if [[ "$MODE" != "--dry-run" ]]; then
+
+    mkdir -p "$JOYMAP_DIR"
+
+    if [[ ! -f "$JOYMAP_FILE" ]] ||
+       ! cmp -s "$JOYMAP_SOURCE" "$JOYMAP_FILE"
+    then
+        install -m 0644 "$JOYMAP_SOURCE" "$JOYMAP_FILE"
+    fi
+
+fi
+
+VICE_ARGS=(
+    -hotkeyfile "$ROOT/emulators/vice/barefront.vhk"
+
+    # BareFront C64 controller keyboard.
+    # F9 is a private transport for C64 RUN/STOP;
+    # physical Escape remains BareFront exit.
+    -keymap 2
+    -symkeymap "$C64_KEYMAP"
+
+    +confirmonexit
+
+    -pal
+
+    -VICIIborders 1
+    -VICIIfilter 0
+    -VICIIglfilter 0
+    -VICIIaspectmode 0
+
+    -VICIIfull
+    +fullscreen-decorations
+    +VICIIshowstatusbar
+
+    +VICIIdsize
+    +VICIIdscan
+    +VICIIvsync
+
+    -basic "$ROOT/bios/c64/basic-901226-01.bin"
+    -kernal "$ROOT/bios/c64/kernal-901227-03.bin"
+    -chargen "$ROOT/bios/c64/chargen-901225-01.bin"
+    -dos1541 "$ROOT/bios/c64/dos1541-325302-01+901229-05.bin"
+
+    -drive8type 1541
+
+    # BareFront C64 controller contract:
+    # Xbox controller -> standard joystick on C64 port 2.
+    -controlport1device 0
+    -joydev1 0
+    -controlport2device 1
+    -joydev2 4
+)
+
+
+# ------------------------------------------------------------
+# BareFront C64 multidisc support.
+#
+# BareFront's canonical public playlist format is .m3u.
+# VICE uses its native .vfl fliplist internally.
+#
+# For .m3u:
+#   - validate ordered relative media paths
+#   - create a private writable workspace in /tmp
+#   - symlink the validated media into that workspace while
+#     preserving their relative paths
+#   - generate VICE's native fliplist inside the workspace
+#   - use CRLF separators with no final line terminator,
+#     matching the already-proven native VICE fliplist format
+#   - remove the whole workspace during normal launcher cleanup
+#     before control returns to BareFront
+#
+# This deliberately avoids writing beside the source playlist,
+# allowing ROM libraries to live on read-only local, USB or
+# network storage.
+#
+# Direct .vfl launching remains supported for compatibility,
+# but .vfl is an implementation detail rather than BareFront's
+# canonical multidisc library format.
+# ------------------------------------------------------------
+
+ROM_EXTENSION="${ROM##*.}"
+ROM_EXTENSION="${ROM_EXTENSION,,}"
+
+FLIPLIST=""
+
+if [[ "$ROM_EXTENSION" == "m3u" ]]; then
+
+    C64_TEMP_DIR="$(mktemp -d /tmp/barefront-vice.XXXXXX)"
+    C64_TEMP_VFL="$C64_TEMP_DIR/playlist.vfl"
+
+    python3 \
+        - "$ROM" "$C64_TEMP_VFL" "$C64_TEMP_DIR" \
+        <<'PY_M3U'
+import os
+import re
+import sys
+from pathlib import Path
+
+supplied = Path(sys.argv[1])
+output = Path(sys.argv[2])
+
+try:
+    workspace = Path(sys.argv[3]).resolve(strict=True)
+except FileNotFoundError:
+    raise SystemExit("Cannot resolve C64 temporary workspace")
+
+if not workspace.is_dir():
+    raise SystemExit("C64 temporary workspace is not a directory")
+
+absolute_playlist = supplied.absolute()
+
+try:
+    root = absolute_playlist.parent.resolve(strict=True)
+    playlist = absolute_playlist.resolve(strict=True)
+except FileNotFoundError:
+    raise SystemExit("Cannot resolve C64 playlist")
+
+try:
+    playlist.relative_to(root)
+except ValueError:
+    raise SystemExit(
+        "Playlist resolves outside its game directory"
+    )
+
+if not playlist.is_file():
+    raise SystemExit("Playlist is not a regular file")
+
+media = []
+seen = set()
+
+try:
+    handle = playlist.open(
+        "r",
+        encoding="utf-8-sig",
+        errors="strict"
+    )
+except OSError:
+    raise SystemExit("Cannot open playlist")
+
+with handle:
+
+    for line_number, raw in enumerate(handle, 1):
+
+        line = raw.strip(" \t\r\n")
+
+        if not line or line.startswith("#"):
+            continue
+
+        def reject(reason):
+            raise SystemExit(
+                f"Line {line_number}: {reason}"
+            )
+
+        if "\x00" in line:
+            reject("NUL character in media path")
+
+        if "\\" in line:
+            reject("Backslash path separator")
+
+        if re.match(r"^[A-Za-z]:", line):
+            reject("Windows absolute path")
+
+        relative = Path(line)
+
+        if relative.is_absolute():
+            reject("Absolute path")
+
+        if ".." in relative.parts:
+            reject("Parent-directory traversal")
+
+        resolved = (root / relative).resolve(strict=False)
+
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            reject("Media resolves outside game directory")
+
+        if resolved == playlist:
+            reject("Playlist references itself")
+
+        if not resolved.is_file():
+            reject(
+                "Referenced media is missing or not a regular file"
+            )
+
+        if resolved in seen:
+            reject("Duplicate media path")
+
+        seen.add(resolved)
+
+        # Preserve the playlist's relative media spelling/order.
+        # VICE will resolve these names inside the private
+        # workspace rather than writing anything into the source
+        # ROM library.
+        media.append(
+            (
+                relative.as_posix(),
+                resolved,
+            )
+        )
+
+if not media:
+    raise SystemExit("Playlist contains no media")
+
+for relative_name, resolved in media:
+    link = workspace / Path(relative_name)
+
+    link.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    link.symlink_to(resolved)
+
+lines = [
+    "; Vice fliplist file",
+    *(relative_name for relative_name, _ in media),
+]
+
+# Proven VICE representation:
+# CRLF between records, no terminator after the final record.
+output.write_bytes(
+    "\r\n".join(lines).encode("utf-8")
+)
+PY_M3U
+
+    FLIPLIST="$C64_TEMP_VFL"
+
+elif [[ "$ROM_EXTENSION" == "vfl" ]]; then
+
+    FLIPLIST="$ROM"
+
+fi
+
+
+if [[ -n "$FLIPLIST" ]]; then
+
+    FIRST_DISK="$(
+        awk '
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+
+                if (line != "" &&
+                    substr(line, 1, 1) != ";")
+                {
+                    print line
+                    exit
+                }
+            }
+        ' "$FLIPLIST"
+    )"
+
+    if [[ -z "$FIRST_DISK" ]]; then
+        echo "VICE fliplist contains no disk images:" >&2
+        echo "  $FLIPLIST" >&2
+        exit 1
+    fi
+
+    if [[ "$FIRST_DISK" == /* ]]; then
+        AUTOSTART_DISK="$FIRST_DISK"
+    else
+        AUTOSTART_DISK="$(
+            dirname "$FLIPLIST"
+        )/$FIRST_DISK"
+    fi
+
+    if [[ ! -f "$AUTOSTART_DISK" ]]; then
+        echo "First VICE fliplist disk not found:" >&2
+        echo "  $AUTOSTART_DISK" >&2
+        exit 1
+    fi
+
+    if [[ "$ROM_EXTENSION" == "m3u" ]]; then
+        echo "  Playlist:    $(basename "$ROM")"
+        echo "  VICE list:   $(basename "$FLIPLIST")"
+    else
+        echo "  Fliplist:    $(basename "$FLIPLIST")"
+    fi
+
+    echo "  First disk:  $(basename "$AUTOSTART_DISK")"
+
+    VICE_ARGS+=(
+        -flipname "$FLIPLIST"
+        -autostart "$AUTOSTART_DISK"
+    )
+
+else
+
+    VICE_ARGS+=(
+        -autostart "$ROM"
+    )
+
+fi
+
+
+env \
+    ENABLE_VKBASALT=1 \
+    VKBASALT_CONFIG_FILE="$VKBASALT_CONFIG" \
+    "$GAMESCOPE" \
+        -b \
+        -g \
+        -r 50.12 \
+        -w "$NATIVE_WIDTH" \
+        -h "$NATIVE_HEIGHT" \
+        -W "$OUTPUT_WIDTH" \
+        -H "$OUTPUT_HEIGHT" \
+        -S integer \
+        -F nearest \
+        -- \
+        /bin/bash -c '
+              guide="$1"
+              keyboard="$2"
+              shift 2
+
+              BAREFRONT_C64_GUIDE_SESSION=1 "$guide" &
+              guide_pid=$!
+
+              BAREFRONT_C64_KEYBOARD_SESSION=1 "$keyboard" &
+              keyboard_pid=$!
+
+              "$@" &
+              game_pid=$!
+
+              cleanup() {
+                  kill -TERM "$keyboard_pid" 2>/dev/null || true
+                  wait "$keyboard_pid" 2>/dev/null || true
+
+                  kill -TERM "$guide_pid" 2>/dev/null || true
+                  wait "$guide_pid" 2>/dev/null || true
+              }
+
+              trap cleanup EXIT
+
+              if wait "$game_pid"; then
+                  status=0
+              else
+                  status=$?
+              fi
+
+              exit "$status"
+        ' _ \
+        "$GUIDE_HELPER" \
+        "$KEYBOARD_HELPER" \
+        "$VICE" \
+        "${VICE_ARGS[@]}" &
+
+GAMESCOPE_PID=$!
+
+
+# Gamescope exists as a normal borderless X11 window. Apply an
+# invisible cursor once, then leave no resident X11 helper
+# running during gameplay.
+sleep 3
+
+"$PRESENTATION_HELPER" hide-cursor || true
+
+
+if wait "$GAMESCOPE_PID"; then
+    GAME_EXIT=0
+else
+    GAME_EXIT=$?
+fi
+
+GAMESCOPE_PID=""
+
+exit "$GAME_EXIT"
+__BAREFRONT_VICE_LAUNCHER__
+
+chmod +x "$VICE_LAUNCHER"
+
+if [[ -x "$VICE_LAUNCHER" ]]; then
+    echo "  VICE adapter: OK"
+    echo "  $VICE_LAUNCHER"
+else
+    die "Could not create the BareFront VICE launcher."
+fi
+
+
+# ------------------------------------------------------------
+# MAME launcher adapter
+#
+# BareFront stores the selected ROM as a complete path such as:
+#
+#   roms/arcade/pacman.zip
+#
+# MAME normally launches by SET NAME:
+#
+#   mame pacman
+#
+# This adapter converts the selected archive path into its set
+# name and supplies all BareFront Arcade / Neo Geo ROM and BIOS
+# locations as MAME search paths.
+# ------------------------------------------------------------
+
+echo
+echo "Verifying tracked Arcade MAME presentation launcher..."
+
+if [[ ! -f "$MAME_ARCADE_LAUNCHER" ]]; then
+    die "Tracked Arcade MAME launcher missing: $MAME_ARCADE_LAUNCHER"
+fi
+
+chmod +x "$MAME_ARCADE_LAUNCHER"
+
+if ! bash -n "$MAME_ARCADE_LAUNCHER"; then
+    die "Arcade MAME launcher shell syntax verification failed."
+fi
+
+if [[ ! -x "$MAME_ARCADE_LAUNCHER" ]]; then
+    die "Arcade MAME launcher is not executable."
+fi
+
+if [[ ! -x "/usr/games/gamescope" ]]; then
+    die "Arcade presentation requires Gamescope."
+fi
+
+if [[ ! -f "$BAREFRONT_DIR/assets/shaders/barecrt/BareCRT_v2.fx" ]]; then
+    die "Arcade presentation requires the shared BareCRT shader."
+fi
+
+if [[ ! -x "$VICE_PRESENTATION_HELPER" ]]; then
+    die "Arcade presentation requires the X11 presentation helper."
+fi
+
+echo "  Arcade launcher: OK"
+echo "  $MAME_ARCADE_LAUNCHER"
+echo "  Gamescope: OK"
+echo "  BareCRT: OK"
+echo "  Presentation helper: OK"
+
+echo
+echo "Verifying tracked Neo Geo MAME presentation launcher..."
+
+if [[ ! -f "$MAME_NEOGEO_LAUNCHER" ]]; then
+    die "Tracked Neo Geo MAME launcher missing: $MAME_NEOGEO_LAUNCHER"
+fi
+
+chmod +x "$MAME_NEOGEO_LAUNCHER"
+
+if ! bash -n "$MAME_NEOGEO_LAUNCHER"; then
+    die "Neo Geo MAME launcher shell syntax verification failed."
+fi
+
+if [[ ! -x "$MAME_NEOGEO_LAUNCHER" ]]; then
+    die "Neo Geo MAME launcher is not executable."
+fi
+
+if [[ ! -x "/usr/games/gamescope" ]]; then
+    die "Neo Geo presentation requires Gamescope."
+fi
+
+if [[ ! -f "$BAREFRONT_DIR/assets/shaders/barecrt/BareCRT_v2.fx" ]]; then
+    die "Neo Geo presentation requires the shared BareCRT shader."
+fi
+
+if [[ ! -x "$VICE_PRESENTATION_HELPER" ]]; then
+    die "Neo Geo presentation requires the X11 presentation helper."
+fi
+
+echo "  Neo Geo launcher: OK"
+echo "  $MAME_NEOGEO_LAUNCHER"
+echo "  Gamescope: OK"
+echo "  BareCRT: OK"
+echo "  Presentation helper: OK"
+
+echo
+echo "Creating/verifying legacy shared MAME launcher..."
+
+cat > "$MAME_LAUNCHER" <<'EOF'
+#!/bin/bash
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROM="${1:-}"
+
+if [[ -z "$ROM" ]]; then
+    echo "Usage: launch_mame.sh <rom-archive>" >&2
+    exit 1
+fi
+
+ROM_DIR="$(dirname "$ROM")"
+ROM_FILE="$(basename "$ROM")"
+SET_NAME="${ROM_FILE%.*}"
+
+# MAME accepts a semicolon-separated ROM search path.
+#
+# Include the selected game's own directory first, then both
+# BareFront MAME-backed system libraries and BIOS directories.
+ROMPATH="$ROM_DIR;$ROOT/roms/arcade;$ROOT/roms/neogeo;$ROOT/bios/arcade;$ROOT/bios/neogeo"
+
+case "$ROM" in
+    "$ROOT"/roms/neogeo/*|roms/neogeo/*|./roms/neogeo/*)
+        SAVE_ROOT="$ROOT/saves/neogeo/mame"
+        ;;
+    *)
+        SAVE_ROOT="$ROOT/saves/arcade/mame"
+        ;;
+esac
+
+mkdir -p \
+    "$SAVE_ROOT/cfg" \
+    "$SAVE_ROOT/nvram" \
+    "$SAVE_ROOT/states" \
+    "$SAVE_ROOT/input"
+
+exec /usr/games/mame \
+    "$SET_NAME" \
+    -rompath "$ROMPATH" \
+    -cfg_directory "$SAVE_ROOT/cfg" \
+    -nvram_directory "$SAVE_ROOT/nvram" \
+    -state_directory "$SAVE_ROOT/states" \
+    -input_directory "$SAVE_ROOT/input"
+EOF
+
+chmod +x "$MAME_LAUNCHER"
+
+if [[ -x "$MAME_LAUNCHER" ]]; then
+    echo "  MAME adapter: OK"
+    echo "  $MAME_LAUNCHER"
+else
+    die "Could not create the BareFront MAME launcher."
+fi
+
+
+# ------------------------------------------------------------
+# Generate the production barefront.ini
+#
+# ROM and screenshot locations are deliberately relative to the
+# BareFront project root. BareFront already loads its assets and
+# barefront.ini relative to that root, and relative library paths
+# mean the whole BareFront folder can move without embedding a
+# particular Linux username in every system entry.
+#
+# Emulator executables/adapters use the paths which this installer
+# has just installed and verified.
+# ------------------------------------------------------------
+
+echo
+echo "Generating production BareFront configuration..."
+
+TEMP_CONFIG="$(mktemp)"
+
+cat > "$TEMP_CONFIG" <<EOF
+# ============================================================
+# BareFront production configuration
+# Generated by the BareFront installer
+#
+# Managed paths only:
+#   roms        game library
+#   screenshots preview screenshot library
+#   emulator    executable / BareFront adapter
+#   arguments   emulator launch arguments
+#
+# {rom} is replaced safely by BareFront with the selected game's
+# complete path. Do not put quotes around {rom}.
+#
+# Production installs use roms/, NEVER testroms/.
+# ============================================================
+
+[megadrive]
+roms=roms/megadrive
+screenshots=assets/games/megadrive
+emulator=$MEDNAFEN_MD_LAUNCHER
+arguments={rom}
+
+[nes]
+roms=roms/nes
+screenshots=assets/games/nes
+emulator=$MESEN_NES_LAUNCHER
+arguments={rom}
+
+[snes]
+roms=roms/snes
+screenshots=assets/games/snes
+emulator=$BSNES_LAUNCHER
+arguments={rom}
+
+[ps1]
+roms=roms/ps1
+screenshots=assets/games/ps1
+emulator=$DUCKSTATION_WRAPPER
+arguments={rom}
+
+[ps2]
+roms=roms/ps2
+screenshots=assets/games/ps2
+emulator=$PCSX2_LAUNCHER
+arguments={rom}
+
+[mastersystem]
+roms=roms/mastersystem
+screenshots=assets/games/mastersystem
+emulator=$MESEN_SMS_LAUNCHER
+arguments={rom}
+
+[atari2600]
+roms=roms/atari2600
+screenshots=assets/games/atari2600
+emulator=$STELLA_LAUNCHER
+arguments={rom}
+
+[c64]
+roms=roms/c64
+screenshots=assets/games/c64
+emulator=$VICE_LAUNCHER
+arguments={rom}
+
+[arcade]
+roms=roms/arcade
+screenshots=assets/games/arcade
+emulator=$MAME_ARCADE_LAUNCHER
+arguments={rom}
+
+[neogeo]
+roms=roms/neogeo
+screenshots=assets/games/neogeo
+emulator=$MAME_NEOGEO_LAUNCHER
+arguments={rom}
+
+[dreamcast]
+roms=roms/dreamcast
+screenshots=assets/games/dreamcast
+emulator=$FLYCAST_LAUNCHER
+arguments={rom}
+
+[saturn]
+roms=roms/saturn
+screenshots=assets/games/saturn
+emulator=$MEDNAFEN_SATURN_LAUNCHER
+arguments={rom}
+
+[pcengine]
+roms=roms/pcengine
+screenshots=assets/games/pcengine
+emulator=$MEDNAFEN_PCE_LAUNCHER
+arguments={rom}
+
+[jaguar]
+roms=roms/jaguar
+screenshots=assets/games/jaguar
+emulator=$BIGPEMU_WRAPPER
+arguments={rom}
+
+[gamecube]
+roms=roms/gamecube
+screenshots=assets/games/gamecube
+emulator=$DOLPHIN_WRAPPER
+arguments={rom}
+
+[amiga]
+roms=roms/amiga
+screenshots=assets/games/amiga
+emulator=$AMIBERRY_LAUNCHER
+arguments={rom}
+EOF
+
+
+# ------------------------------------------------------------
+# Sanity-check the generated candidate before touching the live
+# configuration.
+# ------------------------------------------------------------
+
+echo
+echo "Checking generated configuration..."
+
+EXPECTED_SECTIONS=(
+    megadrive
+    nes
+    snes
+    ps1
+    ps2
+    mastersystem
+    atari2600
+    c64
+    arcade
+    neogeo
+    dreamcast
+    saturn
+    pcengine
+    jaguar
+    gamecube
+    amiga
+)
+
+for section in "${EXPECTED_SECTIONS[@]}"; do
+
+    count="$(
+        grep -c -x "\[$section\]" "$TEMP_CONFIG" || true
+    )"
+
+    if [[ "$count" -ne 1 ]]; then
+        rm -f "$TEMP_CONFIG"
+        die "Generated barefront.ini has an invalid [$section] section."
+    fi
+
+done
+
+if grep -Eq '^(roms|screenshots|emulator|arguments)=.*testroms/' "$TEMP_CONFIG"; then
+    rm -f "$TEMP_CONFIG"
+    die "Production configuration unexpectedly contains testroms/."
+fi
+
+if [[ "$(grep -c '^roms=roms/' "$TEMP_CONFIG")" -ne 16 ]]; then
+    rm -f "$TEMP_CONFIG"
+    die "Generated barefront.ini does not contain 16 production ROM paths."
+fi
+
+if [[ "$(grep -c '^screenshots=assets/games/' "$TEMP_CONFIG")" -ne 16 ]]; then
+    rm -f "$TEMP_CONFIG"
+    die "Generated barefront.ini does not contain 16 screenshot paths."
+fi
+
+if [[ "$(grep -c '^emulator=' "$TEMP_CONFIG")" -ne 16 ]]; then
+    rm -f "$TEMP_CONFIG"
+    die "Generated barefront.ini does not contain 16 emulator entries."
+fi
+
+if [[ "$(grep -c '^arguments=' "$TEMP_CONFIG")" -ne 16 ]]; then
+    rm -f "$TEMP_CONFIG"
+    die "Generated barefront.ini does not contain 16 argument entries."
+fi
+
+echo "  16 systems: OK"
+echo "  roms/ production paths: OK"
+echo "  testroms/ absent: OK"
+echo "  emulator entries: OK"
+
+
+# ------------------------------------------------------------
+# Idempotent/safe config installation
+#
+# Fresh install:
+#   install barefront.ini automatically.
+#
+# Exact rerun:
+#   leave the identical file alone.
+#
+# Existing DIFFERENT configuration:
+#   NEVER silently overwrite the user's file. Keep the candidate
+#   in logs/barefront.ini.generated so it can be compared during
+#   development/update handling.
+# ------------------------------------------------------------
+
+echo
+
+
+# ------------------------------------------------------------
+# Known safe configuration migrations
+#
+# BareFront never generally overwrites an existing user config.
+# However, specific values previously generated by BareFront
+# itself may be migrated when their meaning has changed.
+#
+# This migration moves exact legacy BareFront Mega Drive
+# emulator paths to the Mednafen presentation launcher.
+#
+# Recognised legacy values:
+#   /usr/games/blastem
+#   <BareFront>/emulators/blastem/blastem
+#   emulators/blastem/blastem
+#
+# It runs only on production configs. Development configs using
+# testroms/ are intentionally left untouched.
+# ------------------------------------------------------------
+
+MEDNAFEN_MD_MIGRATION_BACKUP="$LOG_DIR/barefront.ini.pre-megadrive-mednafen-migration"
+
+if [[ -f "$CONFIG_FILE" ]] &&
+   ! grep -Eq '^roms=testroms/' "$CONFIG_FILE"
+then
+
+    MEDNAFEN_MD_MIGRATION_RESULT="$(
+        python3 - \
+            "$CONFIG_FILE" \
+            "$BAREFRONT_DIR/emulators/blastem/blastem" \
+            "$MEDNAFEN_MD_LAUNCHER" \
+            "$MEDNAFEN_MD_MIGRATION_BACKUP" \
+            <<'PYMIGRATE_MD'
+from pathlib import Path
+import shutil
+import sys
+
+config = Path(sys.argv[1])
+old_managed = sys.argv[2]
+new_launcher = sys.argv[3]
+backup = Path(sys.argv[4])
+
+legacy_values = {
+    "emulator=/usr/games/blastem",
+    f"emulator={old_managed}",
+    "emulator=emulators/blastem/blastem",
+}
+
+lines = config.read_text().splitlines()
+
+in_megadrive = False
+target = None
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        in_megadrive = stripped == "[megadrive]"
+        continue
+
+    if in_megadrive and stripped.startswith("emulator="):
+        if stripped in legacy_values:
+            target = index
+        break
+
+if target is None:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+backup.parent.mkdir(parents=True, exist_ok=True)
+
+if not backup.exists():
+    shutil.copy2(config, backup)
+
+indent = lines[target][:len(lines[target]) - len(lines[target].lstrip())]
+lines[target] = f"{indent}emulator={new_launcher}"
+
+config.write_text("\n".join(lines) + "\n")
+
+print("MIGRATED")
+PYMIGRATE_MD
+    )"
+
+    if [[ "$MEDNAFEN_MD_MIGRATION_RESULT" == "MIGRATED" ]]; then
+        echo "Migrated legacy Mega Drive emulator path:"
+        echo "  BlastEm"
+        echo "    ->"
+        echo "  $MEDNAFEN_MD_LAUNCHER"
+        echo
+        echo "Previous configuration backed up to:"
+        echo "  $MEDNAFEN_MD_MIGRATION_BACKUP"
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Stella production-config migration
+#
+# Older BareFront production configs launched Stella directly
+# with only {rom}. Stella 7.0 is now given a BareFront-managed
+# base directory so its configuration and save states remain
+# under the BareFront tree.
+#
+# Only the exact old BareFront-generated Atari 2600 settings are
+# changed. Custom configurations are preserved.
+# ------------------------------------------------------------
+
+STELLA_MIGRATION_BACKUP="$LOG_DIR/barefront.ini.pre-stella-migration"
+
+if [[ -f "$CONFIG_FILE" ]] &&
+   ! grep -Eq '^roms=testroms/' "$CONFIG_FILE"
+then
+
+    STELLA_MIGRATION_RESULT="$(
+        python3 - "$CONFIG_FILE" "$STELLA_BASE_DIR" "$STELLA_MIGRATION_BACKUP" <<'PYSTELLAMIGRATE'
+from pathlib import Path
+import shutil
+import sys
+
+config = Path(sys.argv[1])
+base_dir = sys.argv[2]
+backup = Path(sys.argv[3])
+
+lines = config.read_text().splitlines()
+
+in_atari = False
+emulator_index = None
+arguments_index = None
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_atari:
+            break
+        in_atari = stripped == "[atari2600]"
+        continue
+
+    if not in_atari:
+        continue
+
+    if stripped.startswith("emulator="):
+        emulator_index = index
+    elif stripped.startswith("arguments="):
+        arguments_index = index
+
+if emulator_index is None or arguments_index is None:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+if lines[emulator_index].strip() != "emulator=/usr/bin/stella":
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+if lines[arguments_index].strip() != "arguments={rom}":
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+backup.parent.mkdir(parents=True, exist_ok=True)
+
+if not backup.exists():
+    shutil.copy2(config, backup)
+
+indent = lines[arguments_index][
+    :len(lines[arguments_index]) - len(lines[arguments_index].lstrip())
+]
+
+lines[arguments_index] = (
+    f"{indent}arguments=-basedir {base_dir} {{rom}}"
+)
+
+config.write_text("\n".join(lines) + "\n")
+
+print("MIGRATED")
+PYSTELLAMIGRATE
+    )"
+
+    if [[ "$STELLA_MIGRATION_RESULT" == "MIGRATED" ]]; then
+        echo
+        echo "Migrated legacy Atari 2600 Stella arguments:"
+        echo "  arguments={rom}"
+        echo "    ->"
+        echo "  arguments=-basedir $STELLA_BASE_DIR {rom}"
+        echo
+        echo "Previous configuration backed up to:"
+        echo "  $STELLA_MIGRATION_BACKUP"
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Stella presentation-wrapper migration
+#
+# Current BareFront production configs launch Stella directly
+# with the BareFront-managed base directory.  Atari 2600 now uses
+# the tracked BareFront wrapper so Gamescope owns presentation and
+# BareCRT remains external to Stella.
+#
+# Only the exact BareFront-generated direct-Stella configuration is
+# changed. Custom Atari configurations are preserved.
+# ------------------------------------------------------------
+
+STELLA_WRAPPER_MIGRATION_BACKUP="$LOG_DIR/barefront.ini.pre-stella-wrapper-migration"
+
+if [[ -f "$CONFIG_FILE" ]] &&
+   ! grep -Eq '^roms=testroms/' "$CONFIG_FILE"
+then
+
+    STELLA_WRAPPER_MIGRATION_RESULT="$(
+        python3 - \
+            "$CONFIG_FILE" \
+            "$STELLA_BASE_DIR" \
+            "$STELLA_LAUNCHER" \
+            "$STELLA_WRAPPER_MIGRATION_BACKUP" \
+            <<'PYSTELLAWRAPPERMIGRATE'
+from pathlib import Path
+import shutil
+import sys
+
+config = Path(sys.argv[1])
+base_dir = sys.argv[2]
+launcher = sys.argv[3]
+backup = Path(sys.argv[4])
+
+lines = config.read_text().splitlines()
+
+in_atari = False
+emulator_index = None
+arguments_index = None
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_atari:
+            break
+
+        in_atari = stripped == "[atari2600]"
+        continue
+
+    if not in_atari:
+        continue
+
+    if stripped.startswith("emulator="):
+        emulator_index = index
+    elif stripped.startswith("arguments="):
+        arguments_index = index
+
+if emulator_index is None or arguments_index is None:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+expected_emulator = "emulator=/usr/bin/stella"
+expected_arguments = f"arguments=-basedir {base_dir} {{rom}}"
+
+if lines[emulator_index].strip() != expected_emulator:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+if lines[arguments_index].strip() != expected_arguments:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+backup.parent.mkdir(parents=True, exist_ok=True)
+
+if not backup.exists():
+    shutil.copy2(config, backup)
+
+emulator_indent = lines[emulator_index][
+    :len(lines[emulator_index]) - len(lines[emulator_index].lstrip())
+]
+
+arguments_indent = lines[arguments_index][
+    :len(lines[arguments_index]) - len(lines[arguments_index].lstrip())
+]
+
+lines[emulator_index] = (
+    f"{emulator_indent}emulator={launcher}"
+)
+
+lines[arguments_index] = (
+    f"{arguments_indent}arguments={{rom}}"
+)
+
+config.write_text("\n".join(lines) + "\n")
+
+print("MIGRATED")
+PYSTELLAWRAPPERMIGRATE
+    )"
+
+    if [[ "$STELLA_WRAPPER_MIGRATION_RESULT" == "MIGRATED" ]]; then
+        echo
+        echo "Migrated Atari 2600 to BareFront presentation wrapper:"
+        echo "  emulator=/usr/bin/stella"
+        echo "  arguments=-basedir $STELLA_BASE_DIR {rom}"
+        echo "    ->"
+        echo "  emulator=$STELLA_LAUNCHER"
+        echo "  arguments={rom}"
+        echo
+        echo "Previous configuration backed up to:"
+        echo "  $STELLA_WRAPPER_MIGRATION_BACKUP"
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Flycast production-config migration
+#
+# Older BareFront production configs launched Flycast's AppImage
+# directly. Dreamcast now uses the BareFront launcher so Flycast
+# VMU/NVRAM data is routed under saves/dreamcast/.
+#
+# Only the exact old BareFront-generated Dreamcast settings are
+# changed. Custom configurations are preserved.
+# ------------------------------------------------------------
+
+FLYCAST_MIGRATION_BACKUP="$LOG_DIR/barefront.ini.pre-flycast-migration"
+
+if [[ -f "$CONFIG_FILE" ]] &&
+   ! grep -Eq '^roms=testroms/' "$CONFIG_FILE"
+then
+
+    FLYCAST_MIGRATION_RESULT="$(
+        python3 - "$CONFIG_FILE" "$FLYCAST_EXE" "$FLYCAST_LAUNCHER" "$FLYCAST_MIGRATION_BACKUP" <<'PYFLYCASTMIGRATE'
+from pathlib import Path
+import shutil
+import sys
+
+config = Path(sys.argv[1])
+old_exe = sys.argv[2]
+new_launcher = sys.argv[3]
+backup = Path(sys.argv[4])
+
+lines = config.read_text().splitlines()
+
+in_dreamcast = False
+emulator_index = None
+arguments_index = None
+
+for index, line in enumerate(lines):
+    stripped = line.strip()
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_dreamcast:
+            break
+        in_dreamcast = stripped == "[dreamcast]"
+        continue
+
+    if not in_dreamcast:
+        continue
+
+    if stripped.startswith("emulator="):
+        emulator_index = index
+    elif stripped.startswith("arguments="):
+        arguments_index = index
+
+if emulator_index is None or arguments_index is None:
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+if lines[emulator_index].strip() != f"emulator={old_exe}":
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+if lines[arguments_index].strip() != "arguments={rom}":
+    print("NO_CHANGE")
+    raise SystemExit(0)
+
+backup.parent.mkdir(parents=True, exist_ok=True)
+
+if not backup.exists():
+    shutil.copy2(config, backup)
+
+indent = lines[emulator_index][
+    :len(lines[emulator_index]) - len(lines[emulator_index].lstrip())
+]
+
+lines[emulator_index] = f"{indent}emulator={new_launcher}"
+
+config.write_text("\n".join(lines) + "\n")
+
+print("MIGRATED")
+PYFLYCASTMIGRATE
+    )"
+
+    if [[ "$FLYCAST_MIGRATION_RESULT" == "MIGRATED" ]]; then
+        echo
+        echo "Migrated legacy Dreamcast Flycast launcher:"
+        echo "  $FLYCAST_EXE"
+        echo "    ->"
+        echo "  $FLYCAST_LAUNCHER"
+        echo
+        echo "Previous configuration backed up to:"
+        echo "  $FLYCAST_MIGRATION_BACKUP"
+    fi
+
+fi
+
+
+if [[ ! -e "$CONFIG_FILE" ]]; then
+
+    mv "$TEMP_CONFIG" "$CONFIG_FILE"
+
+    echo "Production configuration installed:"
+    echo "  $CONFIG_FILE"
+
+elif cmp -s "$TEMP_CONFIG" "$CONFIG_FILE"; then
+
+    rm -f "$TEMP_CONFIG"
+
+    echo "Production configuration already matches."
+    echo "  Action: SKIP"
+
+else
+
+    mv "$TEMP_CONFIG" "$CONFIG_CONFLICT"
+
+    echo "WARNING: An existing barefront.ini is different."
+    echo
+    echo "BareFront has NOT overwritten it."
+    echo
+    echo "Existing:"
+    echo "  $CONFIG_FILE"
+    echo
+    echo "Fresh generated candidate:"
+    echo "  $CONFIG_CONFLICT"
+    echo
+    echo "This is intentional protection against destroying user"
+    echo "configuration on a rerun or upgrade."
+
+fi
+
+
+# ------------------------------------------------------------
+# Validate whichever live file exists.
+# ------------------------------------------------------------
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    die "barefront.ini was not created."
+fi
+
+echo
+echo "Live BareFront configuration:"
+echo "  $CONFIG_FILE"
+
+LIVE_SECTION_COUNT="$(
+    grep -c '^\[[^]]\+\]$' "$CONFIG_FILE" || true
+)"
+
+echo "  Sections found: $LIVE_SECTION_COUNT"
+
+if grep -Eq '^roms=testroms/' "$CONFIG_FILE"; then
+
+    echo
+    echo "NOTE: The existing live configuration still contains"
+    echo "development testroms/ paths."
+    echo
+    echo "The production candidate is available at:"
+    echo "  $CONFIG_CONFLICT"
+    echo
+    echo "We will compare this with the golden VM before replacing"
+    echo "its known-good development configuration."
+
+else
+
+    echo "  Production ROM paths: OK"
+
+fi
+
+
+# ------------------------------------------------------------
+# Flycast disc-insertion library
+#
+# Use the effective Dreamcast ROM path from the live BareFront
+# configuration. Preserve an existing non-empty Flycast path.
+# ------------------------------------------------------------
+
+python3 - "$CONFIG_FILE" "$FLYCAST_CONFIG" "$BAREFRONT_DIR" <<'PYFLYCASTCONTENT'
+from pathlib import Path
+import os
+import shutil
+import sys
+import tempfile
+
+barefront = Path(sys.argv[1])
+flycast = Path(sys.argv[2])
+root = Path(sys.argv[3])
+
+section = ""
+rom_paths = []
+
+for raw in barefront.read_text().splitlines():
+    line = raw.strip()
+
+    if line.startswith("[") and line.endswith("]"):
+        section = line
+    elif section == "[dreamcast]" and line.startswith("roms="):
+        rom_paths.append(line.split("=", 1)[1].strip())
+
+if len(rom_paths) != 1 or not rom_paths[0]:
+    print("  WARNING: Cannot determine the live Dreamcast ROM path.")
+    print("           Flycast content path left unchanged.")
+    raise SystemExit(0)
+
+rom_path = os.path.expanduser(rom_paths[0])
+
+if not os.path.isabs(rom_path):
+    rom_path = os.path.join(root, rom_path)
+
+rom_path = os.path.abspath(rom_path)
+
+original = flycast.read_text()
+lines = original.splitlines()
+
+matches = [
+    i for i, line in enumerate(lines)
+    if line.strip().startswith("Dreamcast.ContentPath")
+    and line.split("=", 1)[0].strip() == "Dreamcast.ContentPath"
+    and "=" in line
+]
+
+if len(matches) > 1:
+    print("  WARNING: Multiple Flycast content-path entries.")
+    print("           Existing config preserved.")
+    raise SystemExit(0)
+
+if matches:
+    index = matches[0]
+    current = lines[index].split("=", 1)[1].strip()
+
+    if current:
+        print("  Flycast content path: PRESERVED")
+        print(f"    {current}")
+        raise SystemExit(0)
+
+    prefix = lines[index].split("=", 1)[0]
+    lines[index] = f"{prefix}= {rom_path}"
+
+else:
+    headers = [
+        i for i, line in enumerate(lines)
+        if line.strip() == "[config]"
+    ]
+
+    if len(headers) != 1:
+        print("  WARNING: Flycast [config] section is ambiguous.")
+        print("           Existing config preserved.")
+        raise SystemExit(0)
+
+    lines.insert(
+        headers[0] + 1,
+        f"Dreamcast.ContentPath = {rom_path}"
+    )
+
+fd, backup = tempfile.mkstemp(
+    prefix="emu.cfg.pre-content-path.",
+    dir=flycast.parent
+)
+os.close(fd)
+shutil.copy2(flycast, backup)
+
+flycast.write_text("\n".join(lines) + "\n")
+
+print("  Flycast disc-insertion content path: CONFIGURED")
+print(f"    {rom_path}")
+print(f"  Previous Flycast config: {backup}")
+PYFLYCASTCONTENT
+
+
+# ------------------------------------------------------------
+# Human-readable summary
+# ------------------------------------------------------------
+
+echo
+echo "BareFront production library layout:"
+echo
+echo "  Games:"
+echo "    $BAREFRONT_DIR/roms/<system>/"
+echo
+echo "  BIOS / firmware:"
+echo "    $BAREFRONT_DIR/bios/<system>/"
+echo
+echo "  Saves:"
+echo "    $BAREFRONT_DIR/saves/<system>/"
+echo
+echo "  Preview screenshots:"
+echo "    $BAREFRONT_DIR/assets/games/<system>/"
+echo
+echo "  Preview videos:"
+echo "    $BAREFRONT_DIR/assets/videos/<system>/"
+echo
+echo "Stage 4 configuration generation complete."
+
+
+# ============================================================
+# Stage 5A - BIOS / firmware readiness checker
+# ============================================================
+
+heading "STAGE 5A / FIRMWARE READINESS"
+
+CHECK_BIOS_SCRIPT="$BAREFRONT_DIR/scripts/check_bios.sh"
+
+echo "Creating BareFront firmware checker..."
+echo
+
+
+cat > "$CHECK_BIOS_SCRIPT" <<'EOF'
+#!/bin/bash
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+OK=0
+WARN=0
+FAIL=0
+
+green()
+{
+    printf '\033[1;32m%s\033[0m' "$1"
+}
+
+yellow()
+{
+    printf '\033[1;33m%s\033[0m' "$1"
+}
+
+red()
+{
+    printf '\033[1;31m%s\033[0m' "$1"
+}
+
+heading()
+{
+    echo
+    echo "============================================================"
+    echo "$1"
+    echo "============================================================"
+    echo
+}
+
+pass()
+{
+    local system="$1"
+    local message="$2"
+
+    printf "%-18s " "$system"
+    green "✅"
+    printf " %s\n" "$message"
+
+    OK=$((OK + 1))
+}
+
+warn()
+{
+    local system="$1"
+    local message="$2"
+
+    printf "%-18s " "$system"
+    yellow "⚠"
+    printf " %s\n" "$message"
+
+    WARN=$((WARN + 1))
+}
+
+fail()
+{
+    local system="$1"
+    local message="$2"
+
+    printf "%-18s " "$system"
+    red "❌"
+    printf " %s\n" "$message"
+
+    FAIL=$((FAIL + 1))
+}
+
+has_any_file()
+{
+    local dir="$1"
+
+    [[ -d "$dir" ]] &&
+    find "$dir" -maxdepth 1 -type f -print -quit 2>/dev/null \
+        | grep -q .
+}
+
+
+heading "BAREFRONT FIRMWARE CHECK"
+
+echo "This checker verifies firmware in BareFront's standard folders."
+echo
+echo "Where verified signatures are available, BareFront also"
+echo "recognises user-supplied firmware by checksum."
+echo
+
+
+# ------------------------------------------------------------
+# Systems which require no external firmware for ordinary use
+# ------------------------------------------------------------
+
+pass "Mega Drive"    "No firmware required"
+pass "NES"           "No firmware required"
+pass "Super NES"     "No firmware required"
+pass "Master System" "No firmware required"
+pass "Atari 2600"    "No firmware required"
+pass "Atari Jaguar"  "No mandatory firmware required"
+
+
+# ------------------------------------------------------------
+# GameCube
+#
+# Dolphin can boot without an external IPL, but BareFront uses
+# a real regional IPL to preserve the authentic startup screen.
+# ------------------------------------------------------------
+
+GC_IPL_REGIONS=()
+
+for REGION in EUR USA JAP; do
+    if [[ -f "$ROOT/bios/gamecube/$REGION/IPL.bin" ]]; then
+        GC_IPL_REGIONS+=("$REGION")
+    fi
+done
+
+if [[ "${#GC_IPL_REGIONS[@]}" -gt 0 ]]; then
+    pass "GameCube" "IPL present for: ${GC_IPL_REGIONS[*]}"
+else
+    fail "GameCube" "IPL missing - add bios/gamecube/<region>/IPL.bin"
+fi
+
+
+# ------------------------------------------------------------
+# PlayStation
+#
+# DuckStation needs a real PlayStation BIOS supplied by the user.
+# Legitimate BIOS filenames vary, so BareFront recognises the
+# file contents rather than requiring one particular filename.
+#
+# BareFront does not provide or install BIOS files.
+# ------------------------------------------------------------
+
+PS1_DIR="$ROOT/bios/ps1"
+
+ps1_bios_identity()
+{
+    local path="$1"
+
+    local actual_size
+    local actual_crc32
+    local actual_sha256
+
+    actual_size="$(stat -Lc '%s' "$path")"
+
+    actual_crc32="$(
+        python3 - "$path" <<'PYCRC'
+import sys
+import zlib
+
+with open(sys.argv[1], "rb") as handle:
+    crc = 0
+
+    while True:
+        chunk = handle.read(1024 * 1024)
+
+        if not chunk:
+            break
+
+        crc = zlib.crc32(chunk, crc)
+
+print(f"{crc & 0xffffffff:08x}")
+PYCRC
+    )"
+
+    actual_sha256="$(
+        sha256sum "$path" |
+        awk '{print $1}'
+    )"
+
+    case \
+        "${actual_size}:${actual_crc32,,}:${actual_sha256,,}" \
+    in
+
+        524288:37157331:71af94d1e47a68c11e8fdb9f8368040601514a42a5a399cda48c7d3bff1e99d3)
+            printf '%s\n' "SCPH-1001 v2.2 NTSC-U/C"
+            return 0
+            ;;
+
+        524288:ff3eeb8c:9c0421858e217805f4abe18698afea8d5aa36ff0727eb8484944e00eb5e7eadb)
+            printf '%s\n' "SCPH-5500 v3.0 NTSC-J"
+            return 0
+            ;;
+
+        524288:8d8cb7e4:11052b6499e466bbf0a709b1f9cb6834a9418e66680387912451e971cf8a1fef)
+            printf '%s\n' "SCPH-5501/5503/7003 v3.0 NTSC-U/C"
+            return 0
+            ;;
+
+        524288:318178bf:5e84a94818cf5282f4217591fefd88be36b9b174b3cc7cb0bcd75199beb450f1)
+            printf '%s\n' "SCPH-7002/7502/9002 v4.1 PAL"
+            return 0
+            ;;
+
+    esac
+
+    return 1
+}
+
+
+PS1_FILES=0
+PS1_RECOGNISED=0
+PS1_UNKNOWN=0
+
+if [[ -d "$PS1_DIR" ]]; then
+
+    while IFS= read -r -d '' file; do
+
+        PS1_FILES=$((PS1_FILES + 1))
+
+        if identity="$(ps1_bios_identity "$file")"; then
+            PS1_RECOGNISED=$((PS1_RECOGNISED + 1))
+        else
+            PS1_UNKNOWN=$((PS1_UNKNOWN + 1))
+        fi
+
+    done < <(
+        find -L "$PS1_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -print0 \
+            2>/dev/null
+    )
+
+fi
+
+
+if [[ "$PS1_RECOGNISED" -gt 0 ]]; then
+
+    if [[ "$PS1_UNKNOWN" -gt 0 ]]; then
+        pass "PlayStation" \
+            "$PS1_RECOGNISED recognised BIOS file(s); $PS1_UNKNOWN unrecognised file(s) ignored"
+    else
+        pass "PlayStation" \
+            "$PS1_RECOGNISED recognised BIOS file(s)"
+    fi
+
+elif [[ "$PS1_FILES" -gt 0 ]]; then
+
+    fail "PlayStation" \
+        "BIOS file(s) present but none recognised"
+
+else
+
+    fail "PlayStation" \
+        "BIOS missing - add a supported dump to bios/ps1/"
+
+fi
+
+
+# ------------------------------------------------------------
+# PlayStation 2
+#
+# PCSX2 accepts many legitimate console BIOS revisions/regions.
+# BareFront uses the same ROMVER structure validation as the
+# launcher, then recognises verified BIOS payloads by size,
+# CRC32 and SHA-256.
+#
+# Companion files such as NVM, MEC, ROM1, ROM2 and EROM do not
+# count as a main PS2 BIOS.
+#
+# BareFront does not provide or install BIOS files.
+# ------------------------------------------------------------
+
+PS2_DIR="$ROOT/bios/ps2"
+
+PS2_SCAN="$(
+    python3 - "$PS2_DIR" <<'PYPS2'
+from pathlib import Path
+import hashlib
+import struct
+import sys
+import zlib
+
+bios_dir = Path(sys.argv[1])
+
+REGION_CODES = {
+    "A": "USA",
+    "E": "Europe",
+    "J": "Japan",
+    "H": "Asia",
+    "C": "China",
+    "P": "Free",
+    "X": "Test",
+}
+
+KNOWN = {
+    (
+        4194304,
+        "9386a740",
+        "ee7ae4cc152588b7da1dab17494a321ceafafaf799769baea4e8a28afa5044b1",
+    ): "Europe",
+
+    (
+        4194304,
+        "6f8e3c29",
+        "d6653f4e93be2f6f9e9d690a934f26cf0f6ad4e348b69f41ef736732c3a6685b",
+    ): "Europe",
+
+    (
+        4194304,
+        "b7ef81a9",
+        "c4dad3b5c6ad58bce70a47fc332602880f041c0338ac6be89061c928f6919ab1",
+    ): "Japan",
+
+    (
+        4194304,
+        "a19e0bf5",
+        "f4c948e61a291d4b3f92a141e550cf8357204287a31ff784caccbedaef910c9d",
+    ): "USA",
+}
+
+
+def identify_bios(path):
+    size = path.stat().st_size
+
+    if not (4 * 1024 * 1024 <= size <= 8 * 1024 * 1024):
+        return None
+
+    data = path.read_bytes()
+
+    romdir_pos = None
+
+    for pos in range(0, min(len(data), 512 * 1024), 16):
+        entry = data[pos:pos + 16]
+
+        if len(entry) < 16:
+            break
+
+        if entry[:10].split(b"\0", 1)[0] == b"RESET":
+            romdir_pos = pos
+            break
+
+    if romdir_pos is None:
+        return None
+
+    file_offset = 0
+    pos = romdir_pos
+
+    while pos + 16 <= len(data):
+        entry = data[pos:pos + 16]
+
+        name = (
+            entry[:10]
+            .split(b"\0", 1)[0]
+            .decode("ascii", "ignore")
+        )
+
+        if not name:
+            break
+
+        _, file_size = struct.unpack_from("<HI", entry, 10)
+
+        if name == "ROMVER":
+            romver = data[file_offset:file_offset + 14].decode(
+                "ascii", "replace"
+            )
+
+            if len(romver) != 14:
+                return None
+
+            try:
+                int(romver[0:4])
+                int(romver[6:14])
+            except ValueError:
+                return None
+
+            region = REGION_CODES.get(romver[4])
+
+            if region is None:
+                return None
+
+            return {
+                "region": region,
+                "size": len(data),
+                "crc32": f"{zlib.crc32(data) & 0xffffffff:08x}",
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+
+        file_offset += (file_size + 0x0F) & ~0x0F
+        pos += 16
+
+    return None
+
+
+files = 0
+valid = 0
+recognised = 0
+unknown_valid = 0
+regions = set()
+
+if bios_dir.is_dir():
+    for path in bios_dir.iterdir():
+        if not path.is_file():
+            continue
+
+        files += 1
+
+        info = identify_bios(path)
+
+        if info is None:
+            continue
+
+        valid += 1
+        regions.add(info["region"])
+
+        identity = (
+            info["size"],
+            info["crc32"],
+            info["sha256"],
+        )
+
+        if identity in KNOWN:
+            recognised += 1
+        else:
+            unknown_valid += 1
+
+print(f"FILES={files}")
+print(f"VALID={valid}")
+print(f"RECOGNISED={recognised}")
+print(f"UNKNOWN_VALID={unknown_valid}")
+print(f"REGIONS={' '.join(sorted(regions))}")
+PYPS2
+)"
+
+PS2_FILES=0
+PS2_VALID=0
+PS2_RECOGNISED=0
+PS2_UNKNOWN_VALID=0
+PS2_REGIONS=""
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        FILES)
+            PS2_FILES="$value"
+            ;;
+        VALID)
+            PS2_VALID="$value"
+            ;;
+        RECOGNISED)
+            PS2_RECOGNISED="$value"
+            ;;
+        UNKNOWN_VALID)
+            PS2_UNKNOWN_VALID="$value"
+            ;;
+        REGIONS)
+            PS2_REGIONS="$value"
+            ;;
+    esac
+done <<< "$PS2_SCAN"
+
+
+if [[ "$PS2_RECOGNISED" -gt 0 ]]; then
+
+    message="$PS2_RECOGNISED recognised BIOS image(s)"
+
+    if [[ -n "$PS2_REGIONS" ]]; then
+        message="$message - regions: $PS2_REGIONS"
+    fi
+
+    if [[ "$PS2_UNKNOWN_VALID" -gt 0 ]]; then
+        message="$message; $PS2_UNKNOWN_VALID additional valid unrecognised image(s)"
+    fi
+
+    pass "PlayStation 2" "$message"
+
+elif [[ "$PS2_UNKNOWN_VALID" -gt 0 ]]; then
+
+    warn "PlayStation 2" \
+        "$PS2_UNKNOWN_VALID valid ROMVER BIOS image(s), but checksum not recognised"
+
+elif [[ "$PS2_FILES" -gt 0 ]]; then
+
+    fail "PlayStation 2" \
+        "Files present but no valid main PS2 BIOS found"
+
+else
+
+    fail "PlayStation 2" \
+        "BIOS missing - add a dumped BIOS to bios/ps2/"
+
+fi
+
+
+# ------------------------------------------------------------
+# Commodore 64
+#
+# These exact files match BareFront's VICE launcher adapter.
+# ------------------------------------------------------------
+
+C64_DIR="$ROOT/bios/c64"
+
+C64_REQUIRED=(
+    "basic-901226-01.bin"
+    "kernal-901227-03.bin"
+    "chargen-901225-01.bin"
+    "dos1541-325302-01+901229-05.bin"
+)
+
+C64_MISSING=0
+
+for file in "${C64_REQUIRED[@]}"; do
+    if [[ ! -f "$C64_DIR/$file" ]]; then
+        C64_MISSING=$((C64_MISSING + 1))
+    fi
+done
+
+if [[ "$C64_MISSING" -eq 0 ]]; then
+    pass "Commodore 64" "All four VICE firmware files present"
+else
+    fail "Commodore 64" "$C64_MISSING required firmware file(s) missing"
+fi
+
+
+# ------------------------------------------------------------
+# Arcade
+#
+# Ordinary MAME arcade sets contain their own required ROM
+# components or reference parent/device sets. There is no single
+# universal external BIOS file for the entire Arcade platform.
+# ------------------------------------------------------------
+
+pass "Arcade" "No single global BIOS requirement"
+
+
+# ------------------------------------------------------------
+# Neo Geo
+#
+# MAME owns the Neo Geo BIOS/device-set definition. BareFront
+# therefore asks the installed MAME build to verify neogeo.zip
+# rather than maintaining a duplicate ROM-member database.
+#
+# The archive may live in either bios/neogeo/ or roms/neogeo/.
+# BareFront never downloads, creates or repairs this archive.
+# ------------------------------------------------------------
+
+NEOGEO_BIOS_ARCHIVE="$ROOT/bios/neogeo/neogeo.zip"
+NEOGEO_ROM_ARCHIVE="$ROOT/roms/neogeo/neogeo.zip"
+NEOGEO_MAME="$(command -v mame || true)"
+
+if [[ ! -f "$NEOGEO_BIOS_ARCHIVE" &&
+      ! -f "$NEOGEO_ROM_ARCHIVE" ]]
+then
+
+    warn "Neo Geo" \
+        "neogeo.zip not found in bios/neogeo/ or roms/neogeo/"
+
+elif [[ -z "$NEOGEO_MAME" ]]; then
+
+    warn "Neo Geo" \
+        "neogeo.zip present but MAME is unavailable for verification"
+
+else
+
+    NEOGEO_ROMPATH="$ROOT/bios/neogeo;$ROOT/roms/neogeo"
+
+    if "$NEOGEO_MAME" \
+        -rompath "$NEOGEO_ROMPATH" \
+        -verifyroms neogeo \
+        >/tmp/barefront-neogeo-verify.log 2>&1
+    then
+
+        pass "Neo Geo" \
+            "neogeo.zip verified by MAME"
+
+    else
+
+        warn "Neo Geo" \
+            "neogeo.zip present but failed MAME verification"
+
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Dreamcast
+#
+# BareFront keeps the user's original firmware in bios/dreamcast.
+# Flycast uses a writable copy of dc_flash.bin under saves/.
+# ------------------------------------------------------------
+
+DC_DIR="$ROOT/bios/dreamcast"
+DC_BOOT="$DC_DIR/dc_boot.bin"
+DC_FLASH="$DC_DIR/dc_flash.bin"
+DC_FLASH_WORK="$ROOT/saves/dreamcast/dc_flash.bin"
+
+if [[ -f "$DC_BOOT" && -f "$DC_FLASH" ]]; then
+
+    if [[ ! -f "$DC_FLASH_WORK" ]]; then
+
+        # Stage 5A may seed the working flash copy only when it
+        # does not already exist. It never overwrites a modified
+        # runtime flash file.
+        cp "$DC_FLASH" "$DC_FLASH_WORK"
+
+        pass "Dreamcast" "Firmware present; writable flash copy created"
+
+    else
+
+        pass "Dreamcast" "Boot ROM and source flash present"
+
+    fi
+
+else
+
+    missing=""
+
+    [[ -f "$DC_BOOT" ]] || missing="${missing} dc_boot.bin"
+    [[ -f "$DC_FLASH" ]] || missing="${missing} dc_flash.bin"
+
+    fail "Dreamcast" "Missing:${missing}"
+
+fi
+
+
+# ------------------------------------------------------------
+# Sega Saturn
+#
+# Mednafen uses separate BIOS files for Japan and for
+# North America/Europe.
+#
+# BareFront does not provide or install these files. It only
+# recognises user-supplied dumps by filename, size, CRC32 and
+# SHA-256.
+# ------------------------------------------------------------
+
+SATURN_DIR="$ROOT/bios/saturn"
+SATURN_JP="$SATURN_DIR/sega_101.bin"
+SATURN_NA_EU="$SATURN_DIR/mpr-17933.bin"
+
+saturn_bios_matches()
+{
+    local path="$1"
+    local expected_size="$2"
+    local expected_crc32="$3"
+    local expected_sha256="$4"
+
+    if [[ ! -f "$path" ]]; then
+        return 2
+    fi
+
+    local actual_size
+    local actual_crc32
+    local actual_sha256
+
+    actual_size="$(stat -Lc '%s' "$path")"
+
+    actual_crc32="$(
+        python3 - "$path" <<'PYCRC'
+import sys
+import zlib
+
+with open(sys.argv[1], "rb") as handle:
+    crc = 0
+
+    while True:
+        chunk = handle.read(1024 * 1024)
+
+        if not chunk:
+            break
+
+        crc = zlib.crc32(chunk, crc)
+
+print(f"{crc & 0xffffffff:08x}")
+PYCRC
+    )"
+
+    actual_sha256="$(
+        sha256sum "$path" |
+        awk '{print $1}'
+    )"
+
+    [[ "$actual_size" == "$expected_size" ]] &&
+    [[ "${actual_crc32,,}" == "${expected_crc32,,}" ]] &&
+    [[ "${actual_sha256,,}" == "${expected_sha256,,}" ]]
+}
+
+
+SATURN_JP_STATUS=2
+
+if saturn_bios_matches \
+    "$SATURN_JP" \
+    "524288" \
+    "224b752c" \
+    "dcfef4b99605f872b6c3b6d05c045385cdea3d1b702906a0ed930df7bcb7deac"
+then
+    SATURN_JP_STATUS=0
+else
+    SATURN_JP_STATUS=$?
+fi
+
+
+SATURN_NA_EU_STATUS=2
+
+if saturn_bios_matches \
+    "$SATURN_NA_EU" \
+    "524288" \
+    "4afcf0fa" \
+    "96e106f740ab448cf89f0dd49dfbac7fe5391cb6bd6e14ad5e3061c13330266f"
+then
+    SATURN_NA_EU_STATUS=0
+else
+    SATURN_NA_EU_STATUS=$?
+fi
+
+
+if [[ "$SATURN_JP_STATUS" -eq 0 &&
+      "$SATURN_NA_EU_STATUS" -eq 0 ]]
+then
+
+    pass "Saturn" "Recognised sega_101.bin and mpr-17933.bin"
+
+elif [[ "$SATURN_JP_STATUS" -eq 0 ]]; then
+
+    if [[ "$SATURN_NA_EU_STATUS" -eq 2 ]]; then
+        warn "Saturn" "sega_101.bin recognised; add mpr-17933.bin"
+    else
+        warn "Saturn" "sega_101.bin recognised; mpr-17933.bin is not recognised"
+    fi
+
+elif [[ "$SATURN_NA_EU_STATUS" -eq 0 ]]; then
+
+    if [[ "$SATURN_JP_STATUS" -eq 2 ]]; then
+        warn "Saturn" "mpr-17933.bin recognised; add sega_101.bin"
+    else
+        warn "Saturn" "mpr-17933.bin recognised; sega_101.bin is not recognised"
+    fi
+
+else
+
+    SATURN_PROBLEMS=()
+
+    if [[ "$SATURN_JP_STATUS" -eq 2 ]]; then
+        SATURN_PROBLEMS+=("missing sega_101.bin")
+    else
+        SATURN_PROBLEMS+=("unrecognised sega_101.bin")
+    fi
+
+    if [[ "$SATURN_NA_EU_STATUS" -eq 2 ]]; then
+        SATURN_PROBLEMS+=("missing mpr-17933.bin")
+    else
+        SATURN_PROBLEMS+=("unrecognised mpr-17933.bin")
+    fi
+
+    fail "Saturn" "${SATURN_PROBLEMS[*]}"
+
+fi
+
+
+# ------------------------------------------------------------
+# PC Engine
+#
+# Base PC Engine HuCard emulation does not require BIOS firmware.
+# CD titles need System Card firmware, but not every BareFront
+# PC Engine user will use CD games.
+# ------------------------------------------------------------
+
+PCENGINE_DIR="$ROOT/bios/pcengine"
+
+if [[ -f "$PCENGINE_DIR/syscard3.pce" ]]; then
+    pass "PC Engine" "System Card 3 present for CD games"
+else
+    warn "PC Engine" "HuCards ready; add syscard3.pce for CD games"
+fi
+
+
+# ------------------------------------------------------------
+# Amiga
+#
+# Amiberry identifies Kickstart ROMs by content rather than
+# requiring one particular filename.
+#
+# BareFront treats the A500 1.3, A600 2.05 and A1200 3.1
+# Kickstarts as the complete WHDLoad firmware set. Additional
+# recognised Kickstarts are optional.
+#
+# AROS remains a fallback and does not count as a Commodore
+# Kickstart.
+#
+# BareFront does not provide or install Kickstart ROMs.
+# ------------------------------------------------------------
+
+AMIGA_DIR="$ROOT/bios/amiga"
+
+AMIGA_SCAN="$(
+    python3 - "$AMIGA_DIR" <<'PYAMIGA'
+from pathlib import Path
+import hashlib
+import sys
+import zlib
+
+bios_dir = Path(sys.argv[1])
+
+KNOWN = {
+    (
+        262144,
+        "c4f0f55f",
+        "ee05862d8102a08436ac4056da7d549db31625c7d47b24dfb7b3c9a5c113ca53",
+    ): ("A500_1.3", True),
+
+    (
+        524288,
+        "43b0df7b",
+        "8d57d6e9d976df42d91ff9d10a5eedaede1a00e3b4b34cad750ca5ff7229f28a",
+    ): ("A600_2.05", True),
+
+    (
+        524288,
+        "fc24ae0d",
+        "8c8a0cf04f91b88eaf0c4f1126041987067e2286a8ee590bdbae447a8000c5ee",
+    ): ("A600_3.1", False),
+
+    (
+        524288,
+        "1483a091",
+        "6d43840d4099a74170ea0f0425b6257c3891ebcaa39c4d1840075a9ab22b5707",
+    ): ("A1200_3.1", True),
+}
+
+AROS = {
+    (
+        524288,
+        "20ca1219",
+        "874a9275ff7b39723921eac223a5f461f4eb03bd9ba1976b228ad0f4cfa74505",
+    ),
+    (
+        524288,
+        "7fe47845",
+        "d583ff8f40c73b1584a1395bb0869a909a96d2366a4ae9f4c15ab6a3d868ea62",
+    ),
+}
+
+required_ids = {
+    ident
+    for ident, required in KNOWN.values()
+    if required
+}
+
+recognised_ids = set()
+optional = 0
+aros = 0
+files = 0
+
+if bios_dir.is_dir():
+    for path in bios_dir.iterdir():
+        if not path.is_file():
+            continue
+
+        files += 1
+
+        data = path.read_bytes()
+
+        identity = (
+            len(data),
+            f"{zlib.crc32(data) & 0xffffffff:08x}",
+            hashlib.sha256(data).hexdigest(),
+        )
+
+        if identity in KNOWN:
+            ident, required = KNOWN[identity]
+            recognised_ids.add(ident)
+
+            if not required:
+                optional += 1
+
+        elif identity in AROS:
+            aros += 1
+
+missing = sorted(required_ids - recognised_ids)
+
+print(f"FILES={files}")
+print(f"REQUIRED_FOUND={len(required_ids) - len(missing)}")
+print(f"MISSING={len(missing)}")
+print(f"MISSING_IDS={' '.join(missing)}")
+print(f"OPTIONAL={optional}")
+print(f"AROS={aros}")
+PYAMIGA
+)"
+
+AMIGA_FILES=0
+AMIGA_REQUIRED_FOUND=0
+AMIGA_MISSING=0
+AMIGA_MISSING_IDS=""
+AMIGA_OPTIONAL=0
+AMIGA_AROS=0
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        FILES)
+            AMIGA_FILES="$value"
+            ;;
+        REQUIRED_FOUND)
+            AMIGA_REQUIRED_FOUND="$value"
+            ;;
+        MISSING)
+            AMIGA_MISSING="$value"
+            ;;
+        MISSING_IDS)
+            AMIGA_MISSING_IDS="$value"
+            ;;
+        OPTIONAL)
+            AMIGA_OPTIONAL="$value"
+            ;;
+        AROS)
+            AMIGA_AROS="$value"
+            ;;
+    esac
+done <<< "$AMIGA_SCAN"
+
+
+if [[ "$AMIGA_MISSING" -eq 0 ]]; then
+
+    message="All 3 WHDLoad-required Kickstarts recognised"
+
+    if [[ "$AMIGA_OPTIONAL" -gt 0 ]]; then
+        message="$message; $AMIGA_OPTIONAL additional recognised"
+    fi
+
+    pass "Amiga" "$message"
+
+elif [[ "$AMIGA_REQUIRED_FOUND" -gt 0 ]]; then
+
+    warn "Amiga" \
+        "$AMIGA_MISSING WHDLoad-required Kickstart(s) missing: $AMIGA_MISSING_IDS"
+
+elif [[ "$AMIGA_AROS" -gt 0 ]]; then
+
+    warn "Amiga" \
+        "AROS fallback present; no recognised Commodore Kickstarts"
+
+else
+
+    warn "Amiga" \
+        "No recognised Kickstarts - Amiberry can use built-in AROS fallback"
+
+fi
+
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+TOTAL=$((OK + WARN + FAIL))
+
+echo
+echo "------------------------------------------------------------"
+echo "SUMMARY"
+echo "------------------------------------------------------------"
+echo
+
+printf "Ready / present : %d\n" "$OK"
+printf "Optional/warning: %d\n" "$WARN"
+printf "Missing required: %d\n" "$FAIL"
+printf "Systems checked : %d\n" "$TOTAL"
+
+echo
+
+if [[ "$FAIL" -eq 0 ]]; then
+
+    green "No required firmware is currently missing."
+    echo
+
+else
+
+    red "$FAIL required firmware check(s) need attention."
+    echo
+    echo
+    echo "Add legally obtained/dumped firmware to the folder shown"
+    echo "above, then simply run this checker again:"
+    echo
+    echo "  ./scripts/check_bios.sh"
+
+fi
+
+echo
+echo "BareFront never downloads copyrighted BIOS or firmware."
+echo
+
+# Missing required firmware is reported to the user, but the
+# checker itself exits normally so the installer can continue
+# and provide a complete readiness report.
+exit 0
+EOF
+
+
+chmod +x "$CHECK_BIOS_SCRIPT"
+
+if [[ ! -x "$CHECK_BIOS_SCRIPT" ]]; then
+    die "Could not create the BareFront firmware checker."
+fi
+
+echo "Firmware checker created:"
+echo "  $CHECK_BIOS_SCRIPT"
+
+
+# ------------------------------------------------------------
+# Syntax-check the generated checker before running it.
+# ------------------------------------------------------------
+
+echo
+echo "Checking firmware-checker syntax..."
+
+if bash -n "$CHECK_BIOS_SCRIPT"; then
+    echo "  Syntax: OK"
+else
+    die "Generated check_bios.sh contains a shell syntax error."
+fi
+
+
+# ------------------------------------------------------------
+# Run the checker now.
+#
+# This is informational. Missing user-supplied BIOS files should
+# not make a fresh BareFront installation itself fail.
+# ------------------------------------------------------------
+
+echo
+echo "Running initial firmware readiness check..."
+
+"$CHECK_BIOS_SCRIPT"
+
+echo
+echo "Stage 5A/5B firmware readiness and recognition complete."
+
+
+# ============================================================
+# STAGE 6 / BUILD BAREFRONT
+# ============================================================
+
+heading "STAGE 6 / BUILD BAREFRONT"
+
+BUILD_SCRIPT="$BAREFRONT_DIR/scripts/build_barefront.sh"
+BAREFRONT_BINARY="$BAREFRONT_DIR/barefront"
+OVERLAY_SOURCE="$BAREFRONT_DIR/src/overlay_helper.cpp"
+OVERLAY_BINARY="$BAREFRONT_DIR/overlay_helper"
+
+if [[ ! -x "$BUILD_SCRIPT" ]]; then
+    die "BareFront build script is missing or not executable: $BUILD_SCRIPT"
+fi
+
+if [[ ! -f "$OVERLAY_SOURCE" ]]; then
+    die "BareFront overlay helper source is missing: $OVERLAY_SOURCE"
+fi
+
+echo "Building BareFront from source..."
+"$BUILD_SCRIPT"
+
+if [[ ! -x "$BAREFRONT_BINARY" ]]; then
+    die "BareFront build completed without producing an executable: $BAREFRONT_BINARY"
+fi
+
+if [[ ! -x "$OVERLAY_BINARY" ]]; then
+    die "BareFront build completed without producing the overlay helper: $OVERLAY_BINARY"
+fi
+
+echo
+echo "BareFront executable verified:"
+echo "  $BAREFRONT_BINARY"
+echo "Presentation overlay helper verified:"
+echo "  $OVERLAY_BINARY"
+echo
+echo "Stage 6 BareFront build complete."
+
+
+# ============================================================
+# STAGE 7 / CAPTURE HELPER
+# ============================================================
+
+heading "STAGE 7 / CAPTURE HELPER"
+
+CAPTURE_SOURCE="$BAREFRONT_DIR/src/capture_helper.cpp"
+CAPTURE_BINARY="$BAREFRONT_DIR/capture_helper"
+CAPTURE_RECORDER="$BAREFRONT_DIR/scripts/capture_gamescope_video.sh"
+
+if [[ ! -f "$CAPTURE_SOURCE" ]]; then
+    die "Capture helper source is missing: $CAPTURE_SOURCE"
+fi
+
+if [[ ! -f "$CAPTURE_RECORDER" ]]; then
+    die "Gamescope capture recorder is missing: $CAPTURE_RECORDER"
+fi
+
+chmod +x "$CAPTURE_RECORDER"
+
+if [[ ! -x "$CAPTURE_RECORDER" ]]; then
+    die "Gamescope capture recorder is not executable: $CAPTURE_RECORDER"
+fi
+
+if [[ ! -x "$CAPTURE_BINARY" || "$CAPTURE_SOURCE" -nt "$CAPTURE_BINARY" ]]; then
+
+    echo "Building BareFront capture helper..."
+
+    g++ -std=c++17 "$CAPTURE_SOURCE" -o "$CAPTURE_BINARY" \
+        $(sdl2-config --cflags --libs) \
+        -lX11 -lXi
+
+    echo "Action: BUILD"
+
+else
+
+    echo "Capture helper is already built and current."
+    echo "Action: SKIP"
+
+fi
+
+if [[ ! -x "$CAPTURE_BINARY" ]]; then
+    die "Capture helper build did not produce an executable: $CAPTURE_BINARY"
+fi
+
+CAPTURE_COMMANDS=(
+    ffmpeg
+    gst-launch-1.0
+    gst-inspect-1.0
+    pw-dump
+    pw-link
+    python3
+    timeout
+)
+
+for CAPTURE_COMMAND in "${CAPTURE_COMMANDS[@]}"; do
+    if ! command -v "$CAPTURE_COMMAND" >/dev/null 2>&1; then
+        die "Capture command is unavailable: $CAPTURE_COMMAND"
+    fi
+done
+
+CAPTURE_GSTREAMER_ELEMENTS=(
+    pipewiresrc
+    queue
+    videoconvert
+    videorate
+    videoscale
+    identity
+    x264enc
+    h264parse
+    mp4mux
+    filesink
+)
+
+for CAPTURE_ELEMENT in "${CAPTURE_GSTREAMER_ELEMENTS[@]}"; do
+    if ! gst-inspect-1.0 "$CAPTURE_ELEMENT" >/dev/null 2>&1; then
+        die "Required GStreamer element is unavailable: $CAPTURE_ELEMENT"
+    fi
+done
+
+echo
+echo "Capture helper verified:"
+echo "  $CAPTURE_BINARY"
+echo "Gamescope video recorder verified:"
+echo "  $CAPTURE_RECORDER"
+echo "Capture commands and GStreamer elements: OK"
+echo
+echo "Keyboard capture controls:"
+echo "  P = screenshot"
+echo "  R = 5-second video"
+echo
+echo "Stage 7 capture helper complete."
+
+
+# ============================================================
+# BAREFRONT DESKTOP INTEGRATION
+# ============================================================
+
+heading "BAREFRONT DESKTOP INTEGRATION"
+
+ICON_FILE="$BAREFRONT_DIR/assets/icons/barefront.png"
+APPLICATIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+DESKTOP_FILE="$APPLICATIONS_DIR/barefront.desktop"
+
+if [[ ! -f "$ICON_FILE" ]]; then
+    die "BareFront application icon is missing: $ICON_FILE"
+fi
+
+if [[ ! -x "$BAREFRONT_BINARY" ]]; then
+    die "BareFront executable is missing: $BAREFRONT_BINARY"
+fi
+
+DESKTOP_WORK="$(mktemp -d "$LOG_DIR/barefront-desktop.XXXXXX")"
+DESKTOP_CANDIDATE="$DESKTOP_WORK/barefront.desktop"
+
+cat > "$DESKTOP_CANDIDATE" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=BareFront
+Comment=Curated emulator frontend
+Exec=$BAREFRONT_DIR/barefront
+Path=$BAREFRONT_DIR
+Icon=$ICON_FILE
+Terminal=false
+Categories=Game;
+StartupNotify=false
+EOF
+
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    if ! desktop-file-validate "$DESKTOP_CANDIDATE"; then
+        die "Generated BareFront desktop entry failed validation."
+    fi
+fi
+
+mkdir -p "$APPLICATIONS_DIR"
+
+if [[ -e "$DESKTOP_FILE" || -L "$DESKTOP_FILE" ]]; then
+
+    if [[ ! -L "$DESKTOP_FILE" ]] &&
+       cmp -s "$DESKTOP_CANDIDATE" "$DESKTOP_FILE"; then
+
+        echo "BareFront desktop launcher already current."
+        echo "Action: SKIP"
+
+    else
+
+        echo "Existing BareFront desktop launcher differs."
+        echo "Preserving the user's existing launcher."
+        echo "Action: PRESERVE"
+
+    fi
+
+else
+
+    install -m 644 "$DESKTOP_CANDIDATE" "$DESKTOP_FILE"
+
+    echo "BareFront desktop launcher installed:"
+    echo "  $DESKTOP_FILE"
+    echo "Action: INSTALL"
+
+fi
+
+rm -rf -- "$DESKTOP_WORK"
+
+echo
+echo "BareFront desktop integration complete."
+
+
+# ============================================================
+# v0.12 installation complete
+# ============================================================
+
+heading "BAREFRONT v0.12 INSTALLATION COMPLETE"
+
+echo "Completed:"
+echo "  Pre-flight checks"
+echo "  Common Debian dependencies"
+echo "  Gamescope presentation dependencies / PipeWire service"
+echo "  Production roms/bios/saves directory structure"
+echo "  Debian-managed emulator stage"
+echo "  MesenCE stable installation / verification"
+echo "  DuckStation stable AppImage installation / verification"
+echo "  PCSX2 stable AppImage installation / verification"
+echo "  Flycast stable AppImage installation / verification"
+echo "  Dreamcast BIOS/flash runtime layout"
+echo "  BigPEmu pinned stable installation / verification"
+echo "  bsnes v115 stable-source build / verification"
+echo "  Amiberry official Debian-package installation / integration"
+echo "  PC Engine Mednafen launcher / isolated profile"
+echo "  Saturn Mednafen launcher / isolated profile"
+echo "  VICE BareFront launcher adapter"
+echo "  MAME Arcade / Neo Geo presentation launchers"
+echo "  Production barefront.ini generation / validation"
+echo "  Firmware readiness checker framework"
+echo
+echo "Mesen executable:"
+echo "  $MESEN_EXE"
+echo
+echo "Stage 3 emulator installation is complete."
+echo "Stage 4 production configuration generation is complete."
+echo "Stage 5A firmware readiness checking is complete."
+echo "Stage 5B verified firmware recognition is complete."
+echo
+echo "Installer log:"
+echo "  $LOG_FILE"
+echo

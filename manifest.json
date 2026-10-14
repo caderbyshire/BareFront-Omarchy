@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "barefront.launcher",
+  "name": "BareFront",
+  "version": "0.1.0-preview.1",
+  "author": "Craig Derbyshire",
+  "description": "Install BareFront and its emulators, then launch your retro game library",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "BareFront.qml"},
+  "barWidget": {
+    "displayName": "BareFront",
+    "description": "Install or launch BareFront",
+    "category": "Applications",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
