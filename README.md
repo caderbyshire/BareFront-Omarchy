@@ -10,7 +10,7 @@ BIOS files are supplied by the user.
 Run from a normal user account in an Omarchy terminal:
 
 ```bash
-git clone https://github.com/craigaderbyshire/BareFront-Omarchy.git
+git clone https://github.com/caderbyshire/BareFront-Omarchy.git
 cd BareFront-Omarchy
 bash ./install.sh
 ```
@@ -43,7 +43,7 @@ omarchy plugin enable barefront.launcher right
 Alternatively, install the plugin with:
 
 ```bash
-omarchy plugin add https://github.com/craigaderbyshire/BareFront-Omarchy --enable
+omarchy plugin add https://github.com/caderbyshire/BareFront-Omarchy --enable
 ```
 
 Adding the shell plugin installs
