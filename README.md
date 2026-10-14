@@ -52,6 +52,24 @@ the button; the first click installs the application and emulators.
 Removing the shell plugin leaves the application, ROMs, BIOS files and saves in
 the application directory. They are never stored in the shell plugin directory.
 
+```bash
+omarchy plugin remove barefront.launcher
+```
+
+This removes the bar integration only. Keep `~/.local/share/barefront` to retain
+the application and user data; emulator packages are shared system packages and
+are not removed. No automatic application or save deletion is provided.
+
+## License and dependencies
+
+BareFront and this integration use GPL-3.0-or-later; see `LICENSE`. Bundled fonts,
+shaders and other third-party assets retain their accompanying licenses.
+External dependencies include Omarchy/Quickshell, Arch emulator packages, the
+Amiberry AUR build, upstream emulator downloads, compiler tools, SDL, PipeWire,
+GStreamer, Vulkan, and the private Gamescope/vkBasalt presentation runtime.
+The full package list and pinned downloads are in `installer/adapt.py`,
+`installer/install-runtime.sh` and `application/scripts/install_barefront.sh`.
+
 ## Current limits and validation
 
 Targets Omarchy 4, x86-64 and 1920×1080 output. Other resolutions and architectures
