@@ -5,6 +5,31 @@ Omarchy. Installation sets up the frontend, all supported emulators, controller
 helpers, shaders, capture tools, configuration and desktop launcher. ROMs and
 BIOS files are supplied by the user.
 
+## Screenshots
+
+Main system selection:
+
+![BareFront main system selection](preview.png)
+
+Resource selection (local, external media or network share):
+
+![BareFront resource selection](screenshots/resources.png)
+
+Startup splash:
+
+![BareFront startup splash](screenshots/splash.png)
+
+Mega Drive game menu:
+
+![BareFront Mega Drive game menu](screenshots/game-menu.png)
+
+NES game menu:
+
+![BareFront NES game menu](screenshots/game-menu-2.png)
+
+Screenshots show a user-provided library. ROMs, BIOS files and game preview
+media are not supplied by the installer.
+
 ## Install
 
 Run from a normal user account in an Omarchy terminal:
