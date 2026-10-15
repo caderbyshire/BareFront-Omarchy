@@ -12,6 +12,7 @@ jobs:
       - name: Validate shell and generated Arch installer
         run: |
           bash -n application/scripts/capture_gamescope_video.sh
+          bash -n scripts/update-recorder.sh
           bash -n application/scripts/install_barefront.sh
           python installer/adapt.py
           bash -n application/scripts/install_barefront_arch.sh

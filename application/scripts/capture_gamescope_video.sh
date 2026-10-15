@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-
+# Capture the presented SDL/X11 window, not gamescope's PipeWire source.
+# The private runtime can supply empty NV12 frames and race backend destruction
+# while allocating PipeWire buffers on exit. X11 captures the visible result.
 set -Eeuo pipefail
 
-if (( $# != 9 )); then
-    echo "Usage: $0 OUTPUT SOURCE_WIDTH SOURCE_HEIGHT CROP_X CROP_Y CROP_WIDTH CROP_HEIGHT OUTPUT_WIDTH OUTPUT_HEIGHT" >&2
+if (( $# != 10 )); then
+    echo "Usage: $0 OUTPUT SOURCE_WIDTH SOURCE_HEIGHT CROP_X CROP_Y CROP_WIDTH CROP_HEIGHT OUTPUT_WIDTH OUTPUT_HEIGHT WINDOW_ID" >&2
     exit 2
 fi
 
@@ -16,256 +18,60 @@ CROP_WIDTH="$6"
 CROP_HEIGHT="$7"
 OUTPUT_WIDTH="$8"
 OUTPUT_HEIGHT="$9"
+WINDOW_ID="${10}"
 
-for VALUE in \
-    "$SOURCE_WIDTH" \
-    "$SOURCE_HEIGHT" \
-    "$CROP_WIDTH" \
-    "$CROP_HEIGHT" \
-    "$OUTPUT_WIDTH" \
-    "$OUTPUT_HEIGHT"
-do
+for VALUE in "$SOURCE_WIDTH" "$SOURCE_HEIGHT" "$CROP_WIDTH" "$CROP_HEIGHT" \
+             "$OUTPUT_WIDTH" "$OUTPUT_HEIGHT" "$WINDOW_ID"; do
     if [[ ! "$VALUE" =~ ^[1-9][0-9]*$ ]]; then
-        echo "Invalid capture dimension: $VALUE" >&2
+        echo "Invalid capture dimension or window: $VALUE" >&2
         exit 2
     fi
 done
-
-for VALUE in \
-    "$CROP_X" \
-    "$CROP_Y"
-do
-    if [[ ! "$VALUE" =~ ^[0-9]+$ ]]; then
+for VALUE in "$CROP_X" "$CROP_Y"; do
+    if [[ ! "$VALUE" =~ ^(0|[1-9][0-9]*)$ ]]; then
         echo "Invalid capture position: $VALUE" >&2
         exit 2
     fi
 done
+if (( CROP_X + CROP_WIDTH > SOURCE_WIDTH || CROP_Y + CROP_HEIGHT > SOURCE_HEIGHT ||
+      OUTPUT_WIDTH % 2 || OUTPUT_HEIGHT % 2 )); then
+    echo "Invalid capture bounds or output dimensions." >&2
+    exit 2
+fi
+command -v ffmpeg >/dev/null || { echo 'Capture requires ffmpeg.' >&2; exit 1; }
+: "${DISPLAY:?Capture requires the gameplay X11 display}"
 
-for COMMAND in \
-    ffmpeg \
-    gst-launch-1.0 \
-    pw-dump \
-    pw-link \
-    python3 \
-    timeout
-do
-    if ! command -v "$COMMAND" >/dev/null 2>&1; then
-        echo "Required capture command missing: $COMMAND" >&2
-        exit 1
-    fi
-done
-
-mkdir -p "$(dirname "$OUTPUT_PATH")"
-
-TEMP_OUTPUT="${OUTPUT_PATH}.part.$$.mp4"
-RAW_OUTPUT="${OUTPUT_PATH}.raw.$$.mp4"
-CLIENT_NAME="BareFront-capture-$$"
+mkdir -p -- "$(dirname -- "$OUTPUT_PATH")"
+TEMP_OUTPUT="$(mktemp "${OUTPUT_PATH}.part.XXXXXX.mp4")"
 CAPTURE_PID=""
-
-cleanup()
-{
-    if [[ -n "$CAPTURE_PID" ]] &&
-       kill -0 "$CAPTURE_PID" 2>/dev/null
-    then
-        kill "$CAPTURE_PID" 2>/dev/null || true
+cleanup() {
+    if [[ -n "$CAPTURE_PID" ]]; then
+        kill -TERM "$CAPTURE_PID" 2>/dev/null || true
         wait "$CAPTURE_PID" 2>/dev/null || true
     fi
-
     rm -f -- "$TEMP_OUTPUT"
-    rm -f -- "$RAW_OUTPUT"
 }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-trap cleanup EXIT INT TERM
-
-NODE_ID="$(
-    pw-dump |
-    python3 -c '
-import json
-import sys
-
-for item in json.load(sys.stdin):
-    props = item.get("info", {}).get("props", {})
-
-    if props.get("media.class") == "Video/Source" and (
-        props.get("media.name") == "gamescope"
-        or props.get("node.name") in ("gamescope", "gamescope.bin")
-    ):
-        print(item.get("id", ""))
-        break
-'
-)"
-
-if [[ ! "$NODE_ID" =~ ^[0-9]+$ ]]; then
-    echo "Gamescope PipeWire source was not found." >&2
-    exit 1
-fi
-
-timeout 15s \
-    gst-launch-1.0 -q -e \
-        pipewiresrc \
-            path="$NODE_ID" \
-            client-name="$CLIENT_NAME" \
-            do-timestamp=true \
-        ! queue \
-        ! videoconvert \
-        ! videorate \
-        ! video/x-raw,framerate=30/1 \
-        ! identity eos-after=150 \
-        ! videoscale \
-        ! video/x-raw,width=1280,height=720,pixel-aspect-ratio=1/1 \
-        ! x264enc \
-            speed-preset=ultrafast \
-            tune=zerolatency \
-            bitrate=1200 \
-            key-int-max=30 \
-        ! h264parse \
-        ! mp4mux \
-        ! filesink location="$RAW_OUTPUT" &
-
-CAPTURE_PID=$!
-
-LINKED=false
-
-for (( ATTEMPT=0; ATTEMPT < 50; ++ATTEMPT )); do
-    # Match the selected source by node ID. The private runtime is named
-    # gamescope.bin, so hard-coded gamescope: port names never link it.
-    PORT_IDS="$(
-        pw-dump |
-        python3 -c '
-import json
-import sys
-
-items = json.load(sys.stdin)
-source = int(sys.argv[1])
-client = sys.argv[2]
-destinations = set()
-for item in items:
-    props = item.get("info", {}).get("props", {})
-    if props.get("node.name") == client:
-        destinations.add(item["id"])
-
-output = None
-input_ = None
-for item in items:
-    props = item.get("info", {}).get("props", {})
-    if props.get("port.direction") == "out" and props.get("node.id") == source:
-        output = item["id"]
-    if props.get("port.direction") == "in" and props.get("node.id") in destinations:
-        input_ = item["id"]
-if output is not None and input_ is not None:
-    print(output, input_)
-' "$NODE_ID" "$CLIENT_NAME"
-    )"
-    OUTPUT_PORT=""
-    INPUT_PORT=""
-    read -r OUTPUT_PORT INPUT_PORT <<< "$PORT_IDS" || true
-
-    if [[ -n "$OUTPUT_PORT" &&
-          -n "$INPUT_PORT" ]]
-    then
-        LINK_RESULT=""
-
-        if LINK_RESULT="$(LC_ALL=C pw-link "$OUTPUT_PORT" "$INPUT_PORT" 2>&1)"; then
-            LINKED=true
-            break
-        fi
-
-        if [[ "$LINK_RESULT" == *"File exists"* ]]; then
-            LINKED=true
-            break
-        fi
-    fi
-
-    if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
-        break
-    fi
-
-    sleep 0.1
-done
-
-if [[ "$LINKED" != true ]]; then
-    echo "Could not link Gamescope to the capture pipeline." >&2
-    exit 1
-fi
-
-set +e
-wait "$CAPTURE_PID"
-CAPTURE_EXIT=$?
-set -e
-
-CAPTURE_PID=""
-
-if (( CAPTURE_EXIT != 0 )); then
-    echo "Gamescope recording pipeline failed: $CAPTURE_EXIT" >&2
-    exit "$CAPTURE_EXIT"
-fi
-
-if [[ ! -s "$RAW_OUTPUT" ]]; then
-    echo "Gamescope recording produced no video." >&2
-    exit 1
-fi
-
-# Map the detected game rectangle from the Gamescope window
-# into the fixed 1280x720 PipeWire capture.
-PIPEWIRE_WIDTH=1280
-PIPEWIRE_HEIGHT=720
-
-PIPE_CROP_X=$((CROP_X * PIPEWIRE_WIDTH / SOURCE_WIDTH))
-PIPE_CROP_Y=$((CROP_Y * PIPEWIRE_HEIGHT / SOURCE_HEIGHT))
-
-PIPE_CROP_RIGHT=$(((CROP_X + CROP_WIDTH) * PIPEWIRE_WIDTH / SOURCE_WIDTH))
-PIPE_CROP_BOTTOM=$(((CROP_Y + CROP_HEIGHT) * PIPEWIRE_HEIGHT / SOURCE_HEIGHT))
-
-if (( PIPE_CROP_RIGHT > PIPEWIRE_WIDTH )); then
-    PIPE_CROP_RIGHT=$PIPEWIRE_WIDTH
-fi
-
-if (( PIPE_CROP_BOTTOM > PIPEWIRE_HEIGHT )); then
-    PIPE_CROP_BOTTOM=$PIPEWIRE_HEIGHT
-fi
-
-# H.264 / yuv420p require even crop coordinates and dimensions.
-PIPE_CROP_X=$((PIPE_CROP_X - PIPE_CROP_X % 2))
-PIPE_CROP_Y=$((PIPE_CROP_Y - PIPE_CROP_Y % 2))
-
-PIPE_CROP_WIDTH=$((PIPE_CROP_RIGHT - PIPE_CROP_X))
-PIPE_CROP_HEIGHT=$((PIPE_CROP_BOTTOM - PIPE_CROP_Y))
-
-PIPE_CROP_WIDTH=$((PIPE_CROP_WIDTH - PIPE_CROP_WIDTH % 2))
-PIPE_CROP_HEIGHT=$((PIPE_CROP_HEIGHT - PIPE_CROP_HEIGHT % 2))
-
-if (( PIPE_CROP_WIDTH < 2 ||
-      PIPE_CROP_HEIGHT < 2 ))
-then
-    echo "Mapped Gamescope crop is invalid." >&2
-    exit 1
-fi
-
-FILTER="crop=${PIPE_CROP_WIDTH}:${PIPE_CROP_HEIGHT}:${PIPE_CROP_X}:${PIPE_CROP_Y}"
+# Crop in the actual window's coordinates. Do this before converting to
+# yuv420p, whose chroma alignment would otherwise round odd crop positions.
+FILTER="format=rgb24,crop=${CROP_WIDTH}:${CROP_HEIGHT}:${CROP_X}:${CROP_Y}"
 FILTER+=",scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:flags=lanczos,setsar=1"
-
-ffmpeg \
-    -hide_banner \
-    -loglevel error \
-    -y \
-    -i "$RAW_OUTPUT" \
-    -an \
-    -vf "$FILTER" \
-    -c:v libx264 \
-    -preset veryfast \
-    -crf 23 \
-    -pix_fmt yuv420p \
-    "$TEMP_OUTPUT"
-
-rm -f -- "$RAW_OUTPUT"
-
-if [[ ! -s "$TEMP_OUTPUT" ]]; then
-    echo "Gamescope recording conversion produced no video." >&2
+ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f x11grab -window_id "$WINDOW_ID" -framerate 30 \
+    -video_size "${SOURCE_WIDTH}x${SOURCE_HEIGHT}" -draw_mouse 0 \
+    -i "$DISPLAY" -t 5 -an -vf "$FILTER" \
+    -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
+    "$TEMP_OUTPUT" &
+CAPTURE_PID=$!
+STATUS=0
+wait "$CAPTURE_PID" || STATUS=$?
+CAPTURE_PID=""
+if (( STATUS != 0 )) || [[ ! -s "$TEMP_OUTPUT" ]]; then
+    echo "Gamescope window recording failed: $STATUS" >&2
     exit 1
 fi
-
 mv -f -- "$TEMP_OUTPUT" "$OUTPUT_PATH"
-
-trap - EXIT INT TERM
-
 echo "Video saved: $OUTPUT_PATH"

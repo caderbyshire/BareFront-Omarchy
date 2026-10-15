@@ -1,6 +1,9 @@
-"""Regression checks for renamed PipeWire sources and corrupt downloads."""
+"""Regression checks for window capture lifecycle and corrupt downloads."""
 import hashlib
 import json
+import os
+import signal
+import time
 from pathlib import Path
 import re
 import subprocess
@@ -8,41 +11,86 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-RECORDER = (ROOT / 'application/scripts/capture_gamescope_video.sh').read_text()
 INSTALLER = (ROOT / 'application/scripts/install_barefront.sh').read_text()
-SCRIPTS = re.findall(r"python3 -c '\n(.*?)\n'", RECORDER, re.S)
-
-
-def run_selector(script, objects, *args):
-    return subprocess.run(['python3', '-c', script, *args], input=json.dumps(objects),
-                          text=True, capture_output=True, check=True).stdout.strip()
-
-
-def obj(number, **props):
-    return {'id': number, 'info': {'props': props}}
 
 
 class CaptureTests(unittest.TestCase):
-    def test_private_and_standard_video_sources(self):
-        for name in ('gamescope.bin', 'gamescope'):
-            objects = [obj(1, **{'media.class': 'Audio/Source', 'node.name': name}),
-                       obj(80, **{'media.class': 'Video/Source', 'node.name': name})]
-            self.assertEqual(run_selector(SCRIPTS[0], objects), '80')
+    def run_capture(self, directory, mode="success", *overrides):
+        directory = Path(directory)
+        ffmpeg = directory / "ffmpeg"
+        ffmpeg.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+pathlib.Path(os.environ['CAPTURE_ARGS']).write_text(json.dumps(sys.argv[1:]))
+if os.environ['CAPTURE_MODE'] == 'failure':
+    sys.exit(1)
+if os.environ['CAPTURE_MODE'] == 'wait':
+    pathlib.Path(os.environ['TEST_ENCODER_PID']).write_text(str(os.getpid()))
+    time.sleep(60)
+pathlib.Path(sys.argv[-1]).write_bytes(b'new recording')
+""")
+        ffmpeg.chmod(0o755)
+        output = directory / "preview.mp4"
+        output.write_bytes(b"existing preview")
+        arguments = [str(output), "941", "1023", "13", "21", "901", "975",
+                     "220", "238", "12345"]
+        for index, value in overrides:
+            arguments[index] = value
+        env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH'],
+                   DISPLAY=":test", CAPTURE_ARGS=str(directory / 'args.json'),
+                   TEST_ENCODER_PID=str(directory / 'pid'), CAPTURE_MODE=mode)
+        return subprocess.Popen(['bash', str(ROOT / 'application/scripts/capture_gamescope_video.sh'),
+                                 *arguments], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
 
-    def test_media_name_survives_another_executable_rename(self):
-        objects = [obj(80, **{'media.class': 'Video/Source', 'media.name': 'gamescope',
-                             'node.name': 'private-runtime'})]
-        self.assertEqual(run_selector(SCRIPTS[0], objects), '80')
+    def test_captures_exact_window_and_crop_without_pipewire(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = self.run_capture(directory)
+            process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            args = json.loads((Path(directory) / 'args.json').read_text())
+            self.assertEqual(args[args.index('-window_id') + 1], '12345')
+            self.assertEqual(args[args.index('-video_size') + 1], '941x1023')
+            self.assertEqual(args[args.index('-i') + 1], ':test')
+            self.assertIn('crop=901:975:13:21', args[args.index('-vf') + 1])
+            self.assertEqual((Path(directory) / 'preview.mp4').read_bytes(), b'new recording')
+            self.assertFalse(list(Path(directory).glob('*.part.*')))
 
-    def test_links_selected_node_not_unrelated_capture(self):
-        objects = [obj(81, **{'node.name': 'BareFront-capture-123'}),
-                   obj(84, **{'node.name': 'different-recorder'}),
-                   obj(88, **{'port.direction': 'out', 'node.id': 80}),
-                   obj(89, **{'port.direction': 'out', 'node.id': 999}),
-                   obj(90, **{'port.direction': 'in', 'node.id': 81}),
-                   obj(91, **{'port.direction': 'in', 'node.id': 84})]
-        self.assertEqual(run_selector(SCRIPTS[1], objects, '80', 'BareFront-capture-123'), '88 90')
-        self.assertEqual(run_selector(SCRIPTS[1], objects, '80', 'missing-client'), '')
+    def test_failed_capture_preserves_previous_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = self.run_capture(directory, 'failure')
+            process.communicate(timeout=5)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual((Path(directory) / 'preview.mp4').read_bytes(), b'existing preview')
+            self.assertFalse(list(Path(directory).glob('*.part.*')))
+
+    def test_exit_stops_encoder_and_preserves_previous_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = self.run_capture(directory, 'wait')
+            try:
+                deadline = time.monotonic() + 5
+                pid_file = Path(directory) / 'pid'
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pid_file.exists())
+                encoder_pid = int(pid_file.read_text())
+                process.send_signal(signal.SIGTERM)
+                process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 143)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(encoder_pid, 0)
+                self.assertEqual((Path(directory) / 'preview.mp4').read_bytes(), b'existing preview')
+                self.assertFalse(list(Path(directory).glob('*.part.*')))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_invalid_crop_rejected_before_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = self.run_capture(directory, 'success', (5, '941'))
+            process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 2)
+            self.assertFalse((Path(directory) / 'args.json').exists())
 
 
 class DownloadTests(unittest.TestCase):

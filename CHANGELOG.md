@@ -1,5 +1,13 @@
 # Changes
 
+## 0.1.0-preview.3
+
+- Capture the presented Gamescope X11 window instead of its PipeWire source to
+  avoid green preview recordings and the PipeWire buffer shutdown crash.
+- Preserve existing previews when recording fails or the game exits mid-capture,
+  and terminate the encoder when its capture helper closes.
+- Update the recorder and rebuild its matching helper together, with backups.
+
 ## 0.1.0-preview.2
 
 - Fix five-second video recording with the private Gamescope runtime: detect

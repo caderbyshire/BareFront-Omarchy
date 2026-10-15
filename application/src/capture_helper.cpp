@@ -1024,6 +1024,11 @@ pid_t startRecording(
             );
 
 
+        // This helper runs on the desktop X11 display, alongside Gamescope.
+        // Pass the exact presented window; never attach a PipeWire consumer.
+        std::string presentedWindowId =
+            std::to_string(static_cast<unsigned long long>(captureWindow));
+
         pid_t gamescopePid =
             fork();
 
@@ -1042,6 +1047,7 @@ pid_t startRecording(
                 cropHeight.c_str(),
                 scaledWidth.c_str(),
                 scaledHeight.c_str(),
+                presentedWindowId.c_str(),
                 static_cast<char*>(
                     nullptr
                 )

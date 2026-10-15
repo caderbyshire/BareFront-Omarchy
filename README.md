@@ -123,13 +123,16 @@ extraction. `installer/adapt.py` generates the Arch version and refuses unexpect
 upstream changes.
 
 Gameplay capture uses **P** for a picture and **R** for a five-second silent MP4.
-The recorder recognises the private `gamescope.bin` PipeWire source as well as
-standard Gamescope and links its ports by node ID. Recording was verified against
-the private runtime with a generated animated test window (150 H.264 frames,
-five seconds); this does not establish all-emulator capture coverage.
+The recorder captures the presented Gamescope X11 window directly, with its actual
+size and detected game crop. This avoids the private runtime's empty/green
+PipeWire frames and its buffer-allocation crash during shutdown. Five-second
+animated-window capture and normal game exit have been checked on this machine;
+this does not establish all-emulator capture coverage. Existing green recordings
+need to be recorded again.
 
-For an existing managed installation, update just the recorder after pulling this
-repository (quit BareFront first). This does not rerun the emulator installer:
+For an existing managed installation, update the recorder and rebuild its matching
+helper after pulling this repository (quit BareFront first). This does not rerun
+the emulator installer:
 
 ```bash
 bash scripts/update-recorder.sh

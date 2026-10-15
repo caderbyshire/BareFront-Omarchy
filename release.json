@@ -1,6 +1,6 @@
 {
   "name": "BareFront for Omarchy",
-  "version": "0.1.0-preview.2",
+  "version": "0.1.0-preview.3",
   "status": "preview",
   "upstream": "https://github.com/craigaderbyshire/BareFront",
   "upstreamCommit": "8f0f2da8d7ff4e5fddb48705bbf76bc6e271e8ac",
@@ -17,6 +17,6 @@
   "integrationPatches": [
     "Verified bsnes source commit archive",
     "Verified BigPEmu archive",
-    "Private Gamescope recording source and port selection"
+    "Direct Gamescope X11 window recording with safe cancellation"
   ]
 }
