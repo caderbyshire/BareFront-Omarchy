@@ -1,0 +1,17 @@
+name: Check BareFront integration
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - name: Validate shell and generated Arch installer
+        run: |
+          bash -n application/scripts/capture_gamescope_video.sh
+          bash -n application/scripts/install_barefront.sh
+          python installer/adapt.py
+          bash -n application/scripts/install_barefront_arch.sh

@@ -47,6 +47,13 @@ die()
     exit 1
 }
 
+# Verify downloaded bytes before any archive extraction, source patching or build.
+verify_archive_sha256()
+{
+    local archive="$1" expected="$2"
+    printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
+}
+
 package_is_installed()
 {
     dpkg-query -W -f='${Status}' "$1" 2>/dev/null \
@@ -4852,11 +4859,12 @@ BIGPEMU_CONFIG_BASELINE_SHA256="eaafc829ec705351e10d799dc23922a80195f10caa4800fa
 #
 # For reproducibility BareFront pins the current known stable
 # Linux x64 build and verifies the exact size and upstream
-# FNV-1a hash before extracting it.
+# FNV-1a hash and a pinned SHA-256 before extracting it.
 BIGPEMU_VERSION="1.221"
 BIGPEMU_URL="https://www.richwhitehouse.com/jaguar/builds/BigPEmu_Linux64_v1221.tar.gz"
 BIGPEMU_EXPECTED_SIZE="8912737"
 BIGPEMU_EXPECTED_FNV="C1B241BBFA5135CB"
+BIGPEMU_ARCHIVE_SHA256="c0ff610f21d5f55c01c404ef991d89f769a5b3b893c8570c033bcef44121ee57"
 BIGPEMU_EXPECTED_EXEC_SHA256="2f7cc9c80c1b0cafae432899ace8cf979fa49cf9aa28b572801d7a34480cf8ea"
 
 echo "BareFront uses BigPEmu for:"
@@ -4957,6 +4965,12 @@ if [[ "$NEED_BIGPEMU_INSTALL" -eq 1 ]]; then
         rm -rf "$TEMP_DIR"
         die "BigPEmu download failed."
     fi
+
+    if ! verify_archive_sha256 "$TEMP_ARCHIVE" "$BIGPEMU_ARCHIVE_SHA256"; then
+        rm -rf "$TEMP_DIR"
+        die "BigPEmu archive SHA-256 verification failed."
+    fi
+    echo "  BigPEmu archive SHA-256: OK"
 
 
     # --------------------------------------------------------
@@ -5801,9 +5815,11 @@ BSNES_CONTROL_HELPER="$BSNES_DIR/snes_controller_helper"
 
 # v115 is the final official stable bsnes release from Near/byuu.
 # Official stable Linux binaries are not provided in a form we
-# want to depend on, so BareFront builds the tagged stable source.
+# want to depend on, so BareFront builds the exact stable-release commit.
 BSNES_VERSION="v115"
-BSNES_SOURCE_URL="https://github.com/bsnes-emu/bsnes/archive/refs/tags/v115.tar.gz"
+BSNES_SOURCE_COMMIT="8e80d2f8a43e34a82931e25143b279e5fbcfaedc"
+BSNES_SOURCE_URL="https://github.com/bsnes-emu/bsnes/archive/${BSNES_SOURCE_COMMIT}.tar.gz"
+BSNES_SOURCE_SHA256="4d93abeefb56f2cb944090191835657e459e7ba6fecc70f96798643457e2df7e"
 
 echo "BareFront uses bsnes for:"
 echo "  Super NES"
@@ -5872,6 +5888,12 @@ else
         rm -rf "$TEMP_DIR"
         die "bsnes v115 source download failed."
     fi
+
+    if ! verify_archive_sha256 "$SOURCE_ARCHIVE" "$BSNES_SOURCE_SHA256"; then
+        rm -rf "$TEMP_DIR"
+        die "bsnes source SHA-256 verification failed."
+    fi
+    echo "  bsnes source SHA-256: OK"
 
     echo
     echo "Downloaded archive:"
@@ -6112,6 +6134,8 @@ PYBSNESPSEUDO
 BareFront managed emulator
 Emulator: bsnes
 Release: v115
+Source commit: $BSNES_SOURCE_COMMIT
+Source archive SHA-256: $BSNES_SOURCE_SHA256
 Source: https://github.com/bsnes-emu/bsnes
 Build UI: GTK3
 CPU-specific optimisation: disabled (local=false)

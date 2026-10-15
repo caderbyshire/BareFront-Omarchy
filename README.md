@@ -117,5 +117,20 @@ Debian libraries are installed system-wide. Physical PAL refresh switching on
 Hyprland is not implemented.
 
 Logs are under `~/.local/share/barefront/logs/install-arch.log` by default.
-The original Debian installer remains bundled unchanged; `installer/adapt.py`
-generates the Arch version and refuses unexpected upstream changes.
+The bundled Debian installer includes integration patches to pin bsnes to an exact
+source commit and verify both bsnes and BigPEmu archives with SHA-256 before
+extraction. `installer/adapt.py` generates the Arch version and refuses unexpected
+upstream changes.
+
+Gameplay capture uses **P** for a picture and **R** for a five-second silent MP4.
+The recorder recognises the private `gamescope.bin` PipeWire source as well as
+standard Gamescope and links its ports by node ID. Recording was verified against
+the private runtime with a generated animated test window (150 H.264 frames,
+five seconds); this does not establish all-emulator capture coverage.
+
+For an existing managed installation, update just the recorder after pulling this
+repository (quit BareFront first). This does not rerun the emulator installer:
+
+```bash
+bash scripts/update-recorder.sh
+```

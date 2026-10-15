@@ -1,5 +1,14 @@
 # Changes
 
+## 0.1.0-preview.2
+
+- Fix five-second video recording with the private Gamescope runtime: detect
+  `gamescope.bin` and link PipeWire ports by the selected source's node ID.
+- Pin bsnes v115 to its exact commit and verify the source archive SHA-256
+  before extraction, patching or compilation.
+- Verify BigPEmu's archive SHA-256 before extraction, in addition to the existing
+  upstream size/FNV checks and installed executable SHA-256 check.
+
 ## 0.1.0-preview.1
 
 - Omarchy shell plugin with a BareFront launcher button.

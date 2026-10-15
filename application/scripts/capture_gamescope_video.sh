@@ -86,7 +86,10 @@ import sys
 for item in json.load(sys.stdin):
     props = item.get("info", {}).get("props", {})
 
-    if props.get("node.name") == "gamescope":
+    if props.get("media.class") == "Video/Source" and (
+        props.get("media.name") == "gamescope"
+        or props.get("node.name") in ("gamescope", "gamescope.bin")
+    ):
         print(item.get("id", ""))
         break
 '
@@ -124,16 +127,38 @@ CAPTURE_PID=$!
 LINKED=false
 
 for (( ATTEMPT=0; ATTEMPT < 50; ++ATTEMPT )); do
-    OUTPUT_PORT="$(
-        pw-link -o -I |
-        awk '$2 ~ /^gamescope:/ { print $2; exit }'
-    )"
+    # Match the selected source by node ID. The private runtime is named
+    # gamescope.bin, so hard-coded gamescope: port names never link it.
+    PORT_IDS="$(
+        pw-dump |
+        python3 -c '
+import json
+import sys
 
-    INPUT_PORT="$(
-        pw-link -i -I |
-        awk -v prefix="${CLIENT_NAME}:" \
-            'index($2, prefix) == 1 { print $2; exit }'
+items = json.load(sys.stdin)
+source = int(sys.argv[1])
+client = sys.argv[2]
+destinations = set()
+for item in items:
+    props = item.get("info", {}).get("props", {})
+    if props.get("node.name") == client:
+        destinations.add(item["id"])
+
+output = None
+input_ = None
+for item in items:
+    props = item.get("info", {}).get("props", {})
+    if props.get("port.direction") == "out" and props.get("node.id") == source:
+        output = item["id"]
+    if props.get("port.direction") == "in" and props.get("node.id") in destinations:
+        input_ = item["id"]
+if output is not None and input_ is not None:
+    print(output, input_)
+' "$NODE_ID" "$CLIENT_NAME"
     )"
+    OUTPUT_PORT=""
+    INPUT_PORT=""
+    read -r OUTPUT_PORT INPUT_PORT <<< "$PORT_IDS" || true
 
     if [[ -n "$OUTPUT_PORT" &&
           -n "$INPUT_PORT" ]]
